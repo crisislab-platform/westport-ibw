@@ -1,0 +1,36 @@
+name: westport-ibw-env
+
+channels:
+  - pytorch
+  - nvidia  
+  - conda-forge
+  - defaults
+
+dependencies:
+  - python=3.11
+  - pip
+
+  - gdal
+  - rasterio
+  - geopandas
+  - numpy
+  - matplotlib
+  - pandas
+  - scipy
+  - tqdm
+  - psycopg2
+  - scikit-learn
+  - python-dotenv
+  - onnx
+  - onnxruntime
+  - fiona
+  - cartopy
+  - seaborn
+  - rasterstats
+  - folium
+  - geopands
+
+  - pytorch
+  - torchvision
+  - pytorch-cuda=12.1
+  - nvidia::cuda-toolkit
