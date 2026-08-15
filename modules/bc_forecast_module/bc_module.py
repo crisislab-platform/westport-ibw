@@ -11,8 +11,10 @@ import pandas as pd
 # Flood scenarios hydrographs
 import os
 import glob
+import logging
 import pandas as pd
 
+logger = logging.getLogger(__name__)
 
 
 class BC_Module():
@@ -59,11 +61,11 @@ class BC_Module():
     def get_bc_forecast(self, start_time=None, forecast_horizon=None):
         if start_time == None and forecast_horizon == None:
             return forecast_data
-        forecast_end_time = start_time + pd.Timedelta(hours=forecast_horizon)
+        forecast_end_time = start_time + pd.Timedelta(hours=forecast_horizon-1)
         forecast_data = {k: v for k, v in self.bc_dict.items() if start_time <= k <= forecast_end_time}
         return forecast_data
     
-    def extract_timestep_from_filename(filename):
+    def extract_timestep_from_filename(self, filename):
         # Timestep format is depth_at_2000-01-02_00-00-00.tif, so we need to extract the part after 'depth_at_' and before '.tif'
         timestep_str = filename.split("depth_at_")[1].split(".tif")[0]
         # Convert to datetime object
@@ -75,6 +77,53 @@ class BC_Module():
         bcs = pd.read_csv(bc_file_path)
         self.preprocess_boundary_conditions(bcs)
         
+    def _to_hourly_grid(self, inflow_data):
+        """Keep the on-the-hour rows, so every event is on one hourly grid.
+
+        37 of the 107 boundary-condition files are recorded half-hourly and the
+        other 70 hourly, but everything downstream assumes hourly and breaks
+        three separate ways on the half-hourly ones:
+
+        * the lags below are POSITIONAL shifts, so shift(1..7) spans 3.5 h of
+          history instead of 7 h -- and the scalers were fitted on the hourly
+          window, so the model is handed a shorter history normalised with the
+          wrong statistics;
+        * get_bc_forecast returns TWO steps for a one-hour horizon, doubling
+          num_timesteps and the work per issue;
+        * run_hourly_forecast advances an hour at a time while
+          validate_impact_forecast takes the first forecast step, so the
+          comparison becomes a 30-minute-ahead forecast against the nowcast
+          map -- a different lead time from the hourly events it is averaged
+          with.
+
+        Selecting rather than resampling is exact: every file is aligned to the
+        hour (minutes are {0} for the hourly files and {0, 30} for the rest),
+        so no interpolation is involved and this is a no-op for the 70 already
+        hourly. The half-past flood maps go unused, which costs those events
+        half their validation timesteps and buys a lead time that means the
+        same thing across the set.
+        """
+        on_the_hour = inflow_data['Date_Time'].dt.minute == 0
+        if not on_the_hour.all():
+            logger.info(
+                "%s: boundary conditions are sub-hourly; keeping %d of %d rows "
+                "to put the event on an hourly grid",
+                self.event_code, int(on_the_hour.sum()), len(inflow_data),
+            )
+            inflow_data = inflow_data[on_the_hour].copy()
+
+        # The lags are positional, so a gap here silently means the wrong
+        # history rather than a missing value. Worth saying out loud.
+        gaps = inflow_data['Date_Time'].diff().dropna()
+        if len(gaps) and (gaps != pd.Timedelta(hours=1)).any():
+            logger.warning(
+                "%s: boundary conditions are not contiguous hourly after "
+                "gridding (gaps: %s); the lagged conditioning spans clock time "
+                "unevenly", self.event_code,
+                sorted({str(g) for g in gaps[gaps != pd.Timedelta(hours=1)]}),
+            )
+        return inflow_data
+
     def preprocess_boundary_conditions(self, inflow_data):
         #load the scalers first
         flow_scaler, sea_level_scaler = self.load_scalers()
@@ -108,7 +157,9 @@ class BC_Module():
             inflow_data = inflow_data[inflow_data['Flood_Map_Available']]
             inflow_data = inflow_data[inflow_data['Flood_Map_Available']]
             inflow_data.drop(columns=['Flood_Map_Available'], inplace=True)
-            
+
+        inflow_data = self._to_hourly_grid(inflow_data)
+
         for i in range(1, self.lag + 1):
             inflow_data[f'River_flow-{i}'] = inflow_data['River_flow'].shift(i)
             inflow_data[f'Sea_level-{i}'] = inflow_data['Sea_level'].shift(i)
@@ -141,7 +192,7 @@ class BC_Module():
         for i, row in enumerate(lagged_flow_sea_level):
             self.bc_dict[inflow_data['Date_Time'].iloc[i]] = row
             if self.scenario_id != 0:
-                self.flood_map_dict[['Date_Time'].iloc[i]] = inflow_data['flood_map_file'].iloc[i]
+                self.flood_map_dict[inflow_data['Date_Time'].iloc[i]] = inflow_data['flood_map_file'].iloc[i]
 
     @staticmethod
     def load_scalers():
@@ -153,3 +204,7 @@ class BC_Module():
         """
         scalers = joblib.load(scaler_file_path)
         return scalers["flow_scaler"], scalers["sea_level_scaler"]
+    
+    def get_flood_map_file(self, timestamp):
+        timestamp = pd.to_datetime(timestamp)
+        return self.flood_map_dict.get(timestamp)

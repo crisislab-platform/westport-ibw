@@ -1,0 +1,6 @@
+scenario_id,timestamp,num_buildings_evaluated,damage_threshold,number_affected,number_not_affected,hits,misses,false_alarms,correct_negatives,pod,csi,buffer_multiplier,model,indicator,n_damage_0,misses_damage_0,false_alarms_damage_0,n_damage_1,misses_damage_1,false_alarms_damage_1,n_damage_2,misses_damage_2,false_alarms_damage_2,n_damage_3,misses_damage_3,false_alarms_damage_3
+0,July2021,2247,1,649,1598,585,64,600,998,0.901386748844376,0.46837469975980783,2.0,surveyed,building_hazard_level,1598,0,600,179,40,0,356,20,0,114,4,0
+0,July2021,2247,1,649,1598,585,64,600,998,0.901386748844376,0.46837469975980783,2.0,surveyed,max_depth,1598,0,600,179,40,0,356,20,0,114,4,0
+0,July2021,2247,1,649,1598,449,200,200,1398,0.6918335901386748,0.5288574793875147,2.0,surveyed,mean_depth,1598,0,200,179,104,0,356,86,0,114,10,0
+0,July2021,2247,1,649,1598,635,14,1068,530,0.9784283513097073,0.36983110075713455,2.0,surveyed,overall_building_hazard_level,1598,0,1068,179,12,0,356,2,0,114,0,0
+0,July2021,2247,1,649,1598,618,31,765,833,0.9522342064714946,0.43705799151343705,2.0,surveyed,overall_building_hazard_bp_level,1598,0,765,179,24,0,356,7,0,114,0,0

@@ -22,15 +22,26 @@ dependencies:
   - scikit-learn
   - python-dotenv
   - onnx
-  - onnxruntime
   - fiona
   - cartopy
   - seaborn
   - rasterstats
   - folium
-  - geopands
 
   - pytorch
   - torchvision
   - pytorch-cuda=12.1
   - nvidia::cuda-toolkit
+
+  - pip:
+    - simpful
+    # Only needed for --push_to_arcgis and scripts/make_layer_schemas.py, but
+    # declared because arcgis_module imports it at module level.
+    - arcgis
+    # GPU build, NOT the conda-forge `onnxruntime` package -- that one is
+    # CPU-only, so select_providers() drops CUDAExecutionProvider and the whole
+    # ensemble (10 velocity nets + the VAE decoder) runs on CPU. It needs a
+    # CUDA 12 / cuDNN 9 runtime, which pytorch-cuda=12.1 and pytorch already
+    # provide: ensemble_client imports torch before it opens any session, so
+    # those libraries are loaded by the time onnxruntime looks for them.
+    - onnxruntime-gpu==1.26.0

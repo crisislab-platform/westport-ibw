@@ -2,11 +2,12 @@ import torch
 import logging
 import rasterio
 from rasterio.crs import CRS
+import numpy as np
+import pandas as pd
+import os
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-
 
 def check_device():
     """
@@ -74,5 +75,58 @@ def gdal_writetiff(arr_data, outfile, ras_temp=None, target_transform=None, targ
 
     return 0
 
+def compute_metrics(pred, gt, id_col):
+    # Match prediction and ground truth by feature ID
+    df = pred[[id_col, "inundated", "expected_depth"]].merge(
+        gt[[id_col, "inundated", "expected_depth"]],
+        on=id_col,
+        suffixes=("_pred", "_gt")
+    )
 
+    pred_mask = df["inundated_pred"].astype(bool)
+    gt_mask = df["inundated_gt"].astype(bool)
 
+    TP = np.sum(pred_mask & gt_mask)
+    FP = np.sum(pred_mask & ~gt_mask)
+    FN = np.sum(~pred_mask & gt_mask)
+    TN = np.sum(~pred_mask & ~gt_mask)
+
+    hit_rate = TP / (TP + FN) if (TP + FN) > 0 else np.nan
+    csi = TP / (TP + FP + FN) if (TP + FP + FN) > 0 else np.nan
+
+    # ---------- Depth residuals ----------
+    residual = df["expected_depth_pred"] - df["expected_depth_gt"]
+
+    me = residual.mean()
+    mae = residual.abs().mean()
+    rmse = np.sqrt((residual**2).mean())
+
+    return {
+        "TP": TP,
+        "FP": FP,
+        "FN": FN,
+        "TN": TN,
+        "HitRate": hit_rate,
+        "CSI": csi,
+        "ME": me,
+        "MAE": mae,
+        "RMSE": rmse,
+    }
+    
+def append_metrics(metrics, timestamp, scenario_id, csv_path):
+    row = {
+        "timestamp": pd.to_datetime(timestamp),
+        "scenario_id": scenario_id,
+        **metrics,
+    }
+
+    df = pd.DataFrame([row])
+
+    df.to_csv(
+        csv_path,
+        mode="a",
+        header=not os.path.exists(csv_path),
+        index=False,
+    )
+    
+    
