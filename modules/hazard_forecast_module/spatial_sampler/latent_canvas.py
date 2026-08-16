@@ -30,7 +30,7 @@ from modules.hazard_forecast_module.spatial_sampler.pixel_space_sampler import P
 import rasterio as rio
 import numpy as np
 
-from modules.lib import FLOOD_MAPS_DIR
+from modules.lib import FLOOD_MAPS_DIR, LATENT_DEM_PATH, LATENT_FLOOD_MAP_STATS_DIR
 
 logger = logging.getLogger(__name__)
 
@@ -54,8 +54,12 @@ class LatentCanvas:
         
         #Load the static data from the latent distribution stats.
         self.z_dem = self.get_latent_dem_tiles()
-        self.z_mean = torch.load("/data/westport/data/latent_floodmaps/latent_flood_map_stats.pt")["z_mean"]
-        self.z_std = torch.load("/data/westport/data/latent_floodmaps/latent_flood_map_stats.pt")["z_std"]
+        # map_location because the stats were saved from a CUDA tensor: without
+        # it torch.load raises on a machine with no GPU. The canvas keeps them
+        # on CPU and they are broadcast against CPU latents.
+        _stats = torch.load(LATENT_FLOOD_MAP_STATS_DIR, map_location="cpu")
+        self.z_mean = _stats["z_mean"]
+        self.z_std = _stats["z_std"]
 
         if self.tile_resolution % self.downsample_factor != 0:
             raise ValueError(
@@ -284,12 +288,12 @@ class LatentCanvas:
         return latent_flood_map
     
     def get_latent_dem_tiles(self):
-        latent_dem_file = "/data/westport/data/latent_floodmaps/DEM/dem_latent.pt"
+        latent_dem_file = LATENT_DEM_PATH
         if not os.path.exists(latent_dem_file):
             logger.warning(f"No latent DEM file found at {latent_dem_file}")
             return None
 
-        latent_dem_tensor = torch.load(latent_dem_file)
+        latent_dem_tensor = torch.load(latent_dem_file, map_location="cpu")
         latent_z_mean = latent_dem_tensor.mean(dim=[0, 2, 3], keepdim=True)
         latent_z_std = latent_dem_tensor.std(dim=[0, 2, 3], keepdim=True)
         latent_dem_tensor = (latent_dem_tensor - latent_z_mean) / latent_z_std

@@ -31,7 +31,7 @@ parallel --line-buffer -j 1 \
   --num_deep_ensemble {6} \
   --push_to_arcgis \
   ::: 0 \
-  ::: 1 4 8 \
+  ::: 4 \
   ::: "2021-07-15 12:00:00"\
   ::: "2021-07-15 13:00:00" \
   ::: 10 \

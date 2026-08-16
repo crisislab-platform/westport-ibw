@@ -11,7 +11,7 @@ parallel --line-buffer -j 1 \
   --forecast_horizon {2} \
   --samples_per_member {3} \
   --num_deep_ensemble {4} \
-  ::: $TEST_EVENTS \
+  ::: 83 \
   ::: 1 \
   ::: 10 \
   ::: 10 \

@@ -14,6 +14,10 @@ from rasterio import features
 from rasterio.transform import Affine
 from modules.utils.spatial_operators.operators import  get_sample_georeference,_get_feature_labels
 from modules.utils.spatial_operators.operators import load_features
+# The reductions below run wherever the depth tensor lands. check_device()
+# returns CUDA when it is there and CPU otherwise, so the same code path
+# serves a GPU workstation and a CPU-only laptop.
+from modules.utils.utils import check_device
 from modules.impact_module.fuzzy_risk import (
     overall_building_hazard, object_hazard_columns,
 )
@@ -836,11 +840,11 @@ class ImpactModule():
         # Keep flood map on GPU if possible
         # ---------------------------------------------------------------
         if isinstance(flood_map, np.ndarray):
-            depth = torch.from_numpy(flood_map).float().cuda()
+            depth = torch.from_numpy(flood_map).float().to(check_device())
         elif torch.is_tensor(flood_map):
             depth = flood_map.squeeze().float()
-            if not depth.is_cuda:
-                depth = depth.cuda()
+            if depth.device.type != check_device().type:
+                depth = depth.to(check_device())
         else:
             raise TypeError(
                 "flood_map must be either a NumPy array or a torch.Tensor"
@@ -977,11 +981,11 @@ class ImpactModule():
         # Keep the flood map on the GPU if possible
         # ---------------------------------------------------------------
         if isinstance(flood_map, np.ndarray):
-            depth = torch.from_numpy(flood_map).float().cuda()
+            depth = torch.from_numpy(flood_map).float().to(check_device())
         elif torch.is_tensor(flood_map):
             depth = flood_map.squeeze().float()
-            if not depth.is_cuda:
-                depth = depth.cuda()
+            if depth.device.type != check_device().type:
+                depth = depth.to(check_device())
         else:
             raise TypeError(
                 "flood_map must be either a NumPy array or a torch.Tensor"

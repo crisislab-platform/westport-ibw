@@ -1,0 +1,46 @@
+# CPU-only environment for the feasibility image.
+#
+# Deliberately narrower than the workstation environment.yml:
+#
+#   * pytorch is the cpuonly build and there is no cuda-toolkit -- the image is
+#     ~2 GB instead of ~8 GB, and a laptop with no NVIDIA GPU can run it. The
+#     forecast reads torch.cuda.is_available() rather than assuming a device,
+#     so the same code runs; it just runs on CPU.
+#   * onnxruntime, NOT onnxruntime-gpu. The GPU wheel needs a CUDA 12 runtime it
+#     would not find here, and select_providers() would drop CUDAExecutionProvider
+#     anyway, so installing it would only add weight and a misleading log line.
+#   * no arcgis. It is a heavy dependency (a second GDAL stack) that is only
+#     reachable under --push_to_arcgis, which a feasibility run does not use.
+#     arcgis_module degrades to a clear error if a run asks for it.
+#
+# To run the image on a laptop that DOES have an NVIDIA GPU, swap pytorch's
+# cpuonly for pytorch-cuda and onnxruntime for onnxruntime-gpu, and build with
+# a CUDA base image -- but the point of this image is the CPU number.
+name: westport-ibw-env
+
+channels:
+  - pytorch
+  - conda-forge
+
+dependencies:
+  - python=3.11
+  - pip
+
+  - gdal
+  - rasterio
+  - geopandas
+  - fiona
+  - shapely
+  - numpy
+  - pandas
+  - scipy
+  - scikit-learn
+  - joblib
+  - matplotlib
+  - seaborn
+  - tqdm
+  - python-dotenv
+
+  - pytorch
+  - cpuonly
+  - onnxruntime

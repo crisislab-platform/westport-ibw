@@ -2,3 +2,6 @@
 __pycache__/
 .vscode/
 .conda/
+# Staged Docker build context: ~270 MB of weights and vectors assembled from
+# /data/westport by docker/stage_data.py. Rebuildable, so not tracked.
+docker/data-bundle/

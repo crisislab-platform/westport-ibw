@@ -41,8 +41,18 @@ import time
 
 import numpy as np
 import pandas as pd
-from arcgis.gis import GIS
-from arcgis.features import FeatureLayer, Feature
+# forecast_runner imports this module unconditionally, but the `arcgis` package
+# is only reachable when a run publishes. It is a heavy dependency (it pulls a
+# second GDAL stack), so an install that never passes --push_to_arcgis -- the
+# container image, in particular -- can leave it out and still run a forecast.
+# The failure is deferred to ArcGISModule(), which is only built under that flag.
+try:
+    from arcgis.gis import GIS
+    from arcgis.features import FeatureLayer, Feature
+    _ARCGIS_IMPORT_ERROR = None
+except ImportError as exc:  # pragma: no cover - depends on the install
+    GIS = FeatureLayer = Feature = None
+    _ARCGIS_IMPORT_ERROR = exc
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -171,6 +181,11 @@ LAYERS = {
 
 class ArcGISModule():
     def __init__(self):
+        if _ARCGIS_IMPORT_ERROR is not None:
+            raise RuntimeError(
+                "the `arcgis` package is not installed, so this run cannot "
+                "publish; install it or run without --push_to_arcgis"
+            ) from _ARCGIS_IMPORT_ERROR
         load_dotenv()  # Load environment variables from .env file
         self.arcgis_client_id = os.getenv("ARCGIS_CLIENT_ID")
         self.arcgis_client_secret = os.getenv("ARCGIS_CLIENT_SECRET")
