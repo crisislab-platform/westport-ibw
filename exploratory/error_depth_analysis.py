@@ -37,7 +37,7 @@ from sklearn.metrics import roc_auc_score
 
 from modules.lib import PLACRD_FILE_PATH, SURVEYED_FLOOD_DEPTH_JUL_2021
 from modules.impact_module import fuzzy_risk as fr
-from modules.impact_module.impact_module import ImpactModule, WET_DEPTH_MIN
+from modules.impact_module.risk_module import ImpactModule, WET_DEPTH_MIN
 from modules.forecast_runner.forecast_runner import (
     AFFECTED, AFFECTED_DAMAGE_MIN, _damage_to_affected, _hazards_to_affected,
 )

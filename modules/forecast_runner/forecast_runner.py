@@ -1,8 +1,13 @@
-from modules.bc_forecast_module.bc_module import BC_Module
-from modules.hazard_forecast_module.model_client import FlowMatchingModelClient
-from modules.impact_module.impact_module import ImpactModule, WET_DEPTH_MIN
-from modules.impact_module.fuzzy_risk import TERMS, MIDDLE
-from modules.arcgis_module.arcgis_module import ArcGISModule
+from modules.data_module.bc_module import BC_Module
+from modules.hazard_module.model_client import FlowMatchingModelClient
+from modules.risk_module.risk_module import (
+    RiskModule, WET_DEPTH_MIN, BUILDPROP_MAX_PREFIX, REPORTED_PREFIX, window_peak,
+)
+from modules.risk_module.risk_module_helper import (
+    CLASS_COLUMN_TERMS, CONFIGURATIONS, HAZARD_LEVELS, MIDDLE_CLASS,
+    class_lower_bounds, configuration_prefix,
+)
+from modules.update_module.arcgis_module import ArcGISModule
 from modules.utils.utils import append_metrics, check_device
 from modules.utils.spatial_operators.operators import load_flood_map
 from modules.lib import OUTPUT_DIR, PLACRD_FILE_PATH, SURVEYED_FLOOD_DEPTH_JUL_2021, EXPOSURE_STUDY_RESULTS
@@ -14,8 +19,10 @@ import numpy as np
 import logging
 from sklearn.metrics import confusion_matrix, root_mean_squared_error
 import os
+import shutil
 import time
 from rasterio.transform import rowcol
+from datetime import timedelta
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +72,83 @@ TIMING_COLUMNS = (
 )
 
 RUNTIME_METRICS_FILE = "runtime_metrics.csv"
+
+# The BuildProp-Max depth-exceedance file: ONE ROW PER BUILDING PER FORECAST
+# STEP, which is what separates it from every other CSV the runner writes --
+# those summarise a run to a handful of rows, this one keeps the building axis
+# so a map or a time series can be drawn from it.
+#
+# The three probability columns are P(h >= the depth that class starts at),
+# taken over the ensemble on the BuildProp-Max context indicator
+# max(h_max_building, h_max_property) -- Equation (8) on Equation (7). The
+# hazard class those probabilities elect travels beside them as
+# bp_hazard_level, with its likelihood, so a row carries both axes of the risk
+# matrix and the distribution they were read from.
+EXCEEDANCE_FILE = "hazard_exceedance_buildprop_max.csv"
+
+# The per-building forecast/outcome PAIRS, written only when a simulated map is
+# available to verify against. Separate from EXCEEDANCE_FILE because that one is
+# a forecast product -- written in a live run, where no outcome exists yet --
+# while this is a verification artefact.
+#
+# It exists because reliability cannot be recovered from an aggregate. The
+# metrics CSV holds one row per timestep, and a reliability diagram needs the
+# individual (forecast probability, observed event) pairs so they can be
+# re-binned, stratified by lead time and block-bootstrapped afterwards without
+# rerunning the pipeline.
+VERIFICATION_PAIRS_FILE = "verification_pairs_buildprop_max.csv"
+
+# The horizon window scored as ONE class per building: one row per issue per
+# configuration, not per forecast step. Separate from simulated_validation_metrics
+# because it answers a different question -- that file scores each step against
+# the simulated map of the same hour, which is what the surrogate is asked to do;
+# this one scores what the WARNING issued at that hour promises over its whole
+# window, which is the worst class the building reaches anywhere in it.
+HORIZON_METRICS_FILE = "horizon_window_metrics.csv"
+
+# Frame column -> published name, forecast side then outcome. Same role as
+# EXCEEDANCE_COLUMNS: this tuple IS the schema of the file.
+VERIFICATION_PAIR_COLUMNS = tuple(
+    (f"{BUILDPROP_MAX_PREFIX}_prob_at_least_{term}", f"prob_at_least_{term}")
+    for term in CLASS_COLUMN_TERMS
+)
+
+# Frame column -> published name. Ordered, and the file is appended to with the
+# header written once, so this tuple IS the schema (see the drift guard in
+# write_depth_exceedance).
+EXCEEDANCE_COLUMNS = (
+    ("building_id", "building_id"),
+    ("num_ring_cells", "num_ring_cells"),
+    # Whether the building had a parcel at all. Where it did not, the depth is
+    # its footprint's alone (buildprop_max_depth), and the row should not be
+    # read as a building whose parcel happened to be dry.
+    ("property_known", "property_known"),
+    (f"{BUILDPROP_MAX_PREFIX}_hazard_level", "bp_hazard_level"),
+    (f"{BUILDPROP_MAX_PREFIX}_likelihood", "bp_hazard_likelihood"),
+    # Ensemble-mean h_max of the footprint alone, and of the footprint-or-parcel
+    # depth the probabilities were taken on. Both are means of the maxima.
+    ("depth_max", "depth_max_building"),
+    (f"{BUILDPROP_MAX_PREFIX}_indicator_mean", "depth_max_buildprop"),
+) + tuple(
+    (f"{BUILDPROP_MAX_PREFIX}_prob_at_least_{term}", f"prob_at_least_{term}")
+    for term in CLASS_COLUMN_TERMS
+)
+
+# What the run is, ahead of the building axis, so rows from different issues,
+# leads, scenarios and ensemble sizes can be told apart in one appended file.
+EXCEEDANCE_KEYS = (
+    "scenario_id", "issue_time", "valid_time", "lead_h", "ensemble_size",
+)
+
+
+def _stamp(value):
+    """One timestamp spelling for every appended results file.
+
+    Formatted rather than left as a Timestamp because a chunk whose stamps all
+    fall on midnight writes as a bare date, so an appended file ends up with two
+    time formats in one column and anything reading it back has to parse both.
+    """
+    return None if value is None else pd.Timestamp(value).strftime("%Y-%m-%d %H:%M:%S")
 
 
 @contextmanager
@@ -123,8 +207,75 @@ def _merge_impact(accumulated, step_impact):
     return accumulated
 
 
+def _align_appended_csv(output_file, columns):
+    """Make an appended results file's header match ``columns`` before writing.
+
+    Every results file here is written with ``mode="a"`` and the header written
+    ONCE, so the columns of a later run have to line up with the header already
+    on disk -- positionally, not just by name -- or the run's values land under
+    the wrong names. Two cases, and they are NOT the same failure:
+
+    * The new run only ADDS columns (a statistic added to the ablation, say).
+      Nothing already in the file changes meaning, so the file is REWRITTEN with
+      the new columns in place and empty on the existing rows, and the run
+      appends to it. The accumulated runs survive a widened schema, and an empty
+      cell says exactly what happened: that run did not compute it.
+    * Anything else -- a column renamed, dropped, or one whose meaning moved --
+      can silently re-point a column at a different quantity, which is what this
+      guard exists to stop. The file is archived and a new one started.
+
+    Both cases leave a timestamped ``.csv.bak`` copy, so the rewrite is
+    recoverable too. Returns the path of that copy, or None if the header
+    already matched.
+    """
+    if not os.path.exists(output_file):
+        return None
+
+    existing = pd.read_csv(output_file, nrows=0).columns.tolist()
+    columns = list(columns)
+    if existing == columns:
+        return None
+
+    name = os.path.basename(output_file)
+    stem = os.path.splitext(output_file)[0]
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    # Second-resolution stamps collide if one file is migrated twice inside the
+    # same second, and os.rename would overwrite the earlier copy without a
+    # word -- the one thing a backup must not do.
+    archived = f"{stem}_{stamp}.csv.bak"
+    for attempt in range(2, 100):
+        if not os.path.exists(archived):
+            break
+        archived = f"{stem}_{stamp}-{attempt}.csv.bak"
+
+    # Subset, not strict subset: a pure REORDER is also safe to migrate, since
+    # the rewrite below places every existing value by name.
+    if set(existing) <= set(columns):
+        shutil.copy2(output_file, archived)
+        added = [column for column in columns if column not in existing]
+        pd.read_csv(output_file).reindex(columns=columns).to_csv(
+            output_file, index=False)
+        change = (
+            f"gained {len(added)} column(s) ({', '.join(added[:3])}"
+            f"{', ...' if len(added) > 3 else ''})" if added
+            else "kept its columns in a different order")
+        logger.warning(
+            "%s %s; rewrote it to match, existing rows carry the new columns "
+            "empty, copy at %s", name, change, os.path.basename(archived),
+        )
+        return archived
+
+    os.rename(output_file, archived)
+    logger.warning(
+        "%s had an incompatible column set (renamed or removed, not just "
+        "added); archived it to %s and started a new file.",
+        name, os.path.basename(archived),
+    )
+    return archived
+
+
 class Integrator():
-    def __init__(self, scenario_id, forecast_horizon, push_to_arcgis,samples_per_member, num_deep_ensemble):
+    def __init__(self, scenario_id, forecast_horizon, push_to_arcgis,samples_per_member, num_deep_ensemble, min_exceed_prob):
         self.scenario_id = scenario_id
         self.forecast_horizon = forecast_horizon
         self.push_to_arcgis = push_to_arcgis
@@ -135,10 +286,16 @@ class Integrator():
         self.num_deep_ensemble = num_deep_ensemble
         self.bc_module = BC_Module(scenario_id)
         self.hazard_module = FlowMatchingModelClient(samples_per_member=samples_per_member, num_members=num_deep_ensemble)
-        self.impact_module = ImpactModule(scenario_id)
+        self.impact_module = RiskModule(scenario_id, min_exceed_prob)
         if self.push_to_arcgis:
             self.arcgis_module = ArcGISModule()
         self.device = check_device()
+        # Simulated-map exposure frames, keyed by valid time and bounded to one
+        # horizon (see _ground_truth_buildings). Hourly issues with a 12 h
+        # horizon ask for the same step in twelve consecutive windows, and both
+        # validation paths ask for it independently; without this the exposure
+        # pass over the simulated map runs ~24 times per step instead of once.
+        self._gt_buildings = {}
         self.max_inundation_map = None
         self.max_extent_timestamp = None
         self.max_area = -(np.inf)
@@ -150,7 +307,8 @@ class Integrator():
         else:
             current_time = pd.to_datetime(start_time)
         if end_time == None or end_time=='':
-            end_time = max(self.bc_module.bc_dict.keys())
+            end_time = max(self.bc_module.bc_dict.keys()) 
+            end_time = end_time - timedelta(hours=self.forecast_horizon)
         else:
             end_time = pd.to_datetime(end_time)
         while current_time <= end_time:
@@ -185,10 +343,14 @@ class Integrator():
 
                 #Get the impact forecast for this step using the hazard forecast
                 with _timed(timings, "risk_s", accumulate=True):
-                    _merge_impact(
-                        impact_forecast,
-                        self.impact_module.get_impact_forecast({timestamp: hazard}),
+                    step_impact = self.impact_module.get_impact_forecast(
+                        {timestamp: hazard}
                     )
+                    _merge_impact(impact_forecast, step_impact)
+                # Per step, off this step's frames, before they are folded into
+                # the accumulator -- and outside the timer, since writing the
+                # file is not part of the risk computation it measures.
+                self.write_depth_exceedance(step_impact, current_time)
                 # The inundation extent rides along in the same dict so saving
                 # and publishing both see it without either growing an argument.
                 # Both take a hazard dict, so re-enabling them means passing
@@ -215,12 +377,22 @@ class Integrator():
             #     self.impact_module.save_impact_forecast(impact_forecast, hazard_forecast, current_time)
 
             if test_mode and self.scenario_id !=0 :
-                self.validate_impact_forecast(impact_forecast, current_time)
+                # self.validate_impact_forecast(impact_forecast, current_time)
+                # The same steps scored again as ONE class per building over the
+                # whole window -- what the warning issued at current_time
+                # promises, rather than what each hour of it does.
+                self.validate_impact_forecast_over_horizon(
+                    impact_forecast, current_time)
 
             #Update feature layers on spatial db. current_time is the issue
             #time of THIS forecast; the loop bounds say nothing about the rows
             #being written here.
             if self.push_to_arcgis:
+                # The peak layers ride along in the same dict, so the publisher
+                # needs no special case: they are just three more entries, each
+                # a one-timestamp series keyed by the issue.
+                impact_forecast.update(
+                    _window_peak_frames(impact_forecast, current_time))
                 # Timed inside the publisher rather than around the call, so
                 # clearing the previous issue lands in delete_s and only the
                 # write lands in publish_s.
@@ -291,6 +463,137 @@ class Integrator():
             timings["total_s"] / timings["num_timesteps"],
         )
 
+    def write_depth_exceedance(self, impact_forecast, issue_time):
+        """Append this step's BuildProp-Max exceedance probabilities to
+        out/hazard_exceedance_buildprop_max.csv, one row per building.
+
+        Called per forecast step and per building rather than summarised,
+        because the question the file answers -- how likely is this building to
+        be at or past each hazard class boundary, and when -- has both axes in
+        it. 
+        
+        The columns are EXCEEDANCE_KEYS + EXCEEDANCE_COLUMNS; the
+        probabilities themselves are computed in the impact module, on the
+        member depth stacks, since that is the only place they still exist.
+
+        Written OUTSIDE the risk_s timer by its caller: this is reporting, not
+        the risk computation the horizon sweep measures.
+        """
+        frames = []
+        for valid_time, building_impact in impact_forecast["building_impact"].items():
+            missing = [column for column, _ in EXCEEDANCE_COLUMNS
+                       if column not in building_impact.columns]
+            if missing:
+                logger.warning(
+                    "building frame at %s is missing %s; no exceedance row written",
+                    valid_time, missing,
+                )
+                continue
+            rows = pd.DataFrame({
+                published: building_impact[column].to_numpy()
+                for column, published in EXCEEDANCE_COLUMNS
+            })
+            issue, valid = pd.Timestamp(issue_time), pd.Timestamp(valid_time)
+            keys = {
+                "scenario_id": self.scenario_id,
+                # Formatted rather than left as datetimes: a chunk whose stamps
+                # all fall on midnight writes as a bare date, so an appended
+                # file would carry two time formats in one column.
+                "issue_time": issue.strftime("%Y-%m-%d %H:%M:%S"),
+                "valid_time": valid.strftime("%Y-%m-%d %H:%M:%S"),
+                "lead_h": (valid - issue).total_seconds() / 3600.0,
+                "ensemble_size": self.num_deep_ensemble * self.samples_per_member,
+            }
+            # Prepended through EXCEEDANCE_KEYS rather than in written order, so
+            # the tuple is what fixes the schema and a key added to one without
+            # the other raises here instead of silently reordering the file.
+            for name in reversed(EXCEEDANCE_KEYS):
+                rows.insert(0, name, keys[name])
+            frames.append(rows)
+
+        if not frames:
+            return
+        rows = pd.concat(frames, ignore_index=True)
+
+        os.makedirs(EXPOSURE_STUDY_RESULTS, exist_ok=True)
+        output_file = os.path.join(EXPOSURE_STUDY_RESULTS, EXCEEDANCE_FILE)
+
+        # Same guard as the other appending writers: the header is written
+        # once, so a run whose columns differ from what is already there would
+        # push its values under the wrong names. Renaming a term or adding a
+        # class is exactly that case. Archive the stale file rather than
+        # corrupt it.
+        _align_appended_csv(output_file, rows.columns)
+
+        rows.to_csv(output_file, mode="a",
+                    header=not os.path.exists(output_file), index=False)
+
+        bounds = class_lower_bounds()
+        logger.info(
+            "%s: %d exceedance rows (%d buildings x %d steps) -> %s; "
+            "class lower bounds %s",
+            issue_time, len(rows), len(frames[0]), len(frames), EXCEEDANCE_FILE,
+            ", ".join(f"{term} >= {bound:.2f} m" for term, bound in bounds.items()),
+        )
+
+    def write_verification_pairs(self, building_gt, building_pred,
+                                 issue_time, valid_time,
+                                 observed_column=f"{BUILDPROP_MAX_PREFIX}_hazard_level"):
+        """Append this step's per-building (forecast, outcome) pairs.
+
+        One row per building: the three exceedance probabilities the forecast
+        gave it, and the hazard class the SAME configuration assigned the
+        simulated map. That pairing is the raw material of every calibration
+        statistic -- the reliability diagram, the Brier decomposition, and any
+        re-binning or lead-time stratification of them.
+
+        Written beside the metrics rather than instead of them: compute_metrics
+        reduces these same rows to one line, and a reduction cannot be inverted.
+
+        The two frames are merged on building_id rather than assumed aligned;
+        they are filtered independently for ring coverage upstream, so their
+        row sets are not guaranteed to match.
+        """
+        forecast_columns = [column for column, _ in VERIFICATION_PAIR_COLUMNS]
+        missing = ([observed_column] if observed_column not in building_gt.columns
+                   else []) + [c for c in forecast_columns
+                               if c not in building_pred.columns]
+        if missing:
+            logger.info("no verification pairs at %s; frames lack %s",
+                        valid_time, missing)
+            return
+
+        merged = building_gt[["building_id", observed_column]].merge(
+            building_pred[["building_id"] + forecast_columns], on="building_id",
+        ).dropna(subset=[observed_column] + forecast_columns)
+        if merged.empty:
+            return
+
+        rows = pd.DataFrame({
+            "building_id": merged["building_id"].to_numpy(),
+            "observed_level": merged[observed_column].to_numpy(dtype=int),
+            **{published: merged[column].to_numpy(dtype=float)
+               for column, published in VERIFICATION_PAIR_COLUMNS},
+        })
+        issue, valid = pd.Timestamp(issue_time), pd.Timestamp(valid_time)
+        keys = {
+            "scenario_id": self.scenario_id,
+            "issue_time": issue.strftime("%Y-%m-%d %H:%M:%S"),
+            "valid_time": valid.strftime("%Y-%m-%d %H:%M:%S"),
+            "lead_h": (valid - issue).total_seconds() / 3600.0,
+            "ensemble_size": self.num_deep_ensemble * self.samples_per_member,
+        }
+        for name in reversed(EXCEEDANCE_KEYS):
+            rows.insert(0, name, keys[name])
+
+        os.makedirs(EXPOSURE_STUDY_RESULTS, exist_ok=True)
+        output_file = os.path.join(EXPOSURE_STUDY_RESULTS, VERIFICATION_PAIRS_FILE)
+        _align_appended_csv(output_file, rows.columns)
+        rows.to_csv(output_file, mode="a",
+                    header=not os.path.exists(output_file), index=False)
+        logger.info("%s -> %d verification pairs in %s",
+                    valid_time, len(rows), VERIFICATION_PAIRS_FILE)
+
     def update_max_extent_map(self, hazard_forecast):
         """Keep the single step with the largest inundated area.
 
@@ -312,8 +615,12 @@ class Integrator():
     def validate_forecast(self, start_time=None, end_time=None):
         if self.scenario_id == 0:
             self.validate_exposure_method() 
-        # logger.info(f"Validating forecast for scenario {self.scenario_id} from {start_time} to {end_time}")
-        self.run_hourly_forecast(start_time=start_time, end_time=end_time, test_mode=True)
+        logger.info(
+            f"Validating forecast for scenario {self.scenario_id} "
+            f"from {start_time} to {end_time}"
+        )
+        self.run_hourly_forecast(start_time=start_time, end_time=end_time,
+                                 test_mode=True)
         
     def validate_exposure_method(self):
         # Scored against the surveyed raster, so the surveyed raster defines the
@@ -322,7 +629,7 @@ class Integrator():
         # ground -- it misses 542 buildings the survey reaches, two of them
         # placarded at the most severe damage level, and includes 87 the survey
         # never saw.
-        self.impact_module = ImpactModule(
+        self.impact_module = RiskModule(
             self.scenario_id, domain_raster=SURVEYED_FLOOD_DEPTH_JUL_2021
         )
         with rio.open(SURVEYED_FLOOD_DEPTH_JUL_2021) as src:
@@ -347,35 +654,10 @@ class Integrator():
         method.
         """
 
-        # Every forecast step is scored against the simulated map AT ITS OWN
-        # VALID TIME. This used to take next(iter(...)) for the prediction and
-        # flood_map_dict[current_time] for the truth, which compared a forecast
-        # valid at t+1h against the map at t -- an hour out of phase, every
-        # step. On a receding, tide-driven event that reads as a depth bias:
-        # the forecast leads the truth, so it looks too deep while the water is
-        # rising and too shallow through the whole recession, which is the sign
-        # flip actually observed in the S48 metrics.
-        #
-        # Looping rather than taking the first step also means a horizon > 1 is
-        # scored at every lead time instead of only the shortest, with lead_h
-        # recorded so the leads can be separated afterwards.
         for valid_time, building_pred in impact_forecast["building_impact"].items():
-            gt_file = self.bc_module.flood_map_dict.get(valid_time)
-            if gt_file is None:
-                # bc_dict is filtered to timestamps that have a map, so this is
-                # not expected; say which step was skipped rather than score it
-                # against the wrong hour.
-                logger.warning(
-                    "no simulated map at %s; that forecast step is not scored",
-                    valid_time,
-                )
+            building_gt = self._ground_truth_buildings(valid_time)
+            if building_gt is None:
                 continue
-
-            gt_hazard_map = load_flood_map(gt_file, self.bc_module.event_name)
-            gt_impact = self.impact_module.get_impact_forecast(
-                {str(valid_time): [gt_hazard_map]}
-            )
-            building_gt = next(iter(gt_impact["building_impact"].values())).copy()
 
             # ----------------------------------------------------------------
             # Remove buildings without sampled cells
@@ -391,11 +673,232 @@ class Integrator():
             # compared anything.
             building_metrics = self.compute_metrics(building_gt, building_pred)
 
+            # The pairs behind those scores, per building, so the calibration
+            # can be looked at rather than only summarised.
+            self.write_verification_pairs(
+                building_gt, building_pred, current_time, valid_time)
+
             self.write_results_simulated(
                 current_time,
                 building_metrics,
                 model="flow_matching",
                 valid_time=valid_time,
+            )
+  
+            
+    def _ground_truth_buildings(self, valid_time):
+        """The simulated map at ``valid_time``, through the same exposure pass.
+
+        The building frame the forecast is scored against: one "member", so the
+        exceedance probabilities it carries are 0 or 1 and its hazard class is
+        the deterministic class of that map's context indicator. Returns None
+        when no simulated map exists for the step, having said which step that
+        was -- bc_dict is filtered to timestamps that have a map, so it is not
+        expected, and a step scored against the wrong hour is worse than a step
+        not scored at all.
+
+        Cached because the same valid time is asked for repeatedly: hourly
+        issues with a horizon of H put each step in H consecutive windows, and
+        both validation paths ask for it independently. The cache is bounded to
+        one horizon and evicted oldest-first, which is enough -- the windows
+        advance an hour at a time, so nothing older than the current one is ever
+        asked for again -- and keeps the memory to one window's worth of frames
+        rather than the whole event's.
+
+        The frame is handed back UNCOPIED; callers filter it, which already
+        makes a new frame. Anything that mutates in place must copy first.
+        """
+        valid_time = pd.Timestamp(valid_time)
+        if valid_time in self._gt_buildings:
+            return self._gt_buildings[valid_time]
+
+        gt_file = self.bc_module.flood_map_dict.get(valid_time)
+        if gt_file is None:
+            logger.warning(
+                "no simulated map at %s; that forecast step is not scored",
+                valid_time,
+            )
+            return None
+
+        gt_hazard_map = load_flood_map(gt_file, self.bc_module.event_name)
+        gt_impact = self.impact_module.get_impact_forecast(
+            {str(valid_time): [gt_hazard_map]}
+        )
+        frame = next(iter(gt_impact["building_impact"].values()))
+
+        self._gt_buildings[valid_time] = frame
+        while len(self._gt_buildings) > max(self.forecast_horizon, 1) + 1:
+            # dicts keep insertion order, and the windows advance forwards, so
+            # the oldest entry is the one furthest behind the current window.
+            self._gt_buildings.pop(next(iter(self._gt_buildings)))
+        return frame
+
+    def validate_impact_forecast_over_horizon(self, impact_forecast, issue_time,
+                                              prefixes=None):
+        """Score the whole forecast window as ONE hazard class per building.
+
+        ``validate_impact_forecast`` scores every step against the simulated map
+        of the same hour, which is the right question to ask of the surrogate and
+        the wrong one to ask of the warning: a warning issued at ``issue_time``
+        covers the whole horizon, so what it promises a building is the WORST
+        class it reaches anywhere in the window, not the class it holds at any
+        one hour. Both sides are collapsed the same way -- the max over the
+        window's steps -- and the pair is scored once per issue, which is the
+        row this writes.
+
+        Collapsing with a MAX rather than reading the class at the peak-depth
+        step keeps the two sides symmetric and is the rule the risk matrix
+        already places a building by (the highest class it reaches, Equation 8),
+        so a forecast is not punished for putting the peak an hour early. What
+        it does hide is timing, and deliberately: the window is the unit of the
+        warning, and when inside it the water arrives is a separate question.
+
+        The likelihood travels with the class it belongs to. For each building
+        the step kept is one that actually reached its window class, tie-broken
+        by the HIGHEST likelihood among the steps that reached it -- the
+        strongest statement the forecast made at the class it is scored on.
+
+        One row per issue per configuration in out/horizon_window_metrics.csv,
+        defaulting to BuildProp-Max, the configuration the rest of the
+        probabilistic verification is written for. More prefixes add ROWS, not
+        columns, so the ablation can be swept without migrating the file.
+        """
+        prefixes = (BUILDPROP_MAX_PREFIX,) if prefixes is None else tuple(prefixes)
+        levels = {prefix: f"{prefix}_hazard_level" for prefix in prefixes}
+        likelihoods = {prefix: f"{prefix}_likelihood" for prefix in prefixes}
+
+        # Sliced to the scored columns before they are concatenated: the frames
+        # carry geometry and every configuration's columns, and the window holds
+        # all of its steps at once.
+        observed_steps, forecast_steps, scored_times = [], [], []
+        for valid_time, building_pred in impact_forecast.get(
+                "building_impact", {}).items():
+            building_gt = self._ground_truth_buildings(valid_time)
+            if building_gt is None:
+                continue
+            # The same ring-coverage filter the per-step scoring applies: a
+            # building with no sampled cell has no indicator to collapse.
+            observed_steps.append(_take_columns(
+                building_gt[building_gt["num_ring_cells"] > 0],
+                ["building_id"] + list(levels.values())))
+            forecast_steps.append(_take_columns(
+                building_pred[building_pred["num_ring_cells"] > 0],
+                ["building_id"] + list(levels.values())
+                + list(likelihoods.values())))
+            scored_times.append(pd.Timestamp(valid_time))
+
+        if not scored_times:
+            logger.info("%s: no simulated map anywhere in the window; no horizon "
+                        "row written", issue_time)
+            return
+
+        observed = pd.concat(observed_steps, ignore_index=True)
+        forecast = pd.concat(forecast_steps, ignore_index=True)
+
+        rows = []
+        for prefix in prefixes:
+            level, likelihood = levels[prefix], likelihoods[prefix]
+            # dict.fromkeys, not a plain concatenation: the class column can
+            # be absent on BOTH sides, and naming it twice reads as two faults.
+            missing = list(dict.fromkeys(
+                ([level] if level not in observed.columns else [])
+                + [column for column in (level, likelihood)
+                   if column not in forecast.columns]))
+            if missing:
+                logger.info("no horizon metrics for %s; the frames lack %s",
+                            prefix, missing)
+                continue
+
+            window = _window_peak(observed, forecast, level, likelihood)
+            if window.empty:
+                logger.info("no horizon metrics for %s; no building carries a "
+                            "class on both sides of the window", prefix)
+                continue
+
+            configuration, indicators_used = _configuration_name(prefix)
+            rows.append({
+                "scenario_id": self.scenario_id,
+                # The issue time IS the start of the window (get_bc_forecast
+                # runs from it inclusive); window_start/_end are the SCORED
+                # span, which is shorter wherever a step had no simulated map.
+                "issue_time": _stamp(issue_time),
+                "window_start": _stamp(min(scored_times)),
+                "window_end": _stamp(max(scored_times)),
+                "forecast_horizon": self.forecast_horizon,
+                "num_steps": len(scored_times),
+                "num_deep_ensemble": self.num_deep_ensemble,
+                "samples_per_member": self.samples_per_member,
+                "ensemble_size": self.num_deep_ensemble * self.samples_per_member,
+                "configuration": configuration,
+                "indicators_used": indicators_used,
+                **self.compute_horizon_metrics(window),
+            })
+
+        if not rows:
+            return
+        self.write_horizon_results(rows)
+
+    def compute_horizon_metrics(self, window):
+        """Compute pooled POD, FAR, CSI and signed risk-level bias.
+
+        ``window`` is one row per building: the class the simulated maps reach
+        over the window (``observed``), the class the forecast reaches
+        (``forecast``), and the likelihood the forecast attached to its OWN
+        class (``likelihood``).
+
+        The ordinal comparison uses mutually exclusive outcomes: exact class
+        agreement is a hit, an underestimate is a miss, and an overestimate is
+        a false alert. This avoids counting an overestimate as both a hit and a
+        false alert. ``risk_level_bias`` is forecast minus observed, averaged
+        over buildings.
+        """
+        observed = window["observed"].astype(int)
+        forecast = window["forecast"].astype(int)
+
+        n_hit = int((forecast == observed).sum())
+        n_miss = int((forecast < observed).sum())
+        n_false = int((forecast > observed).sum())
+
+        pod_denominator = n_hit + n_miss
+        far_denominator = n_hit + n_false
+        csi_denominator = n_hit + n_miss + n_false
+        return {
+            "n_buildings": int(len(window)),
+            "n_hit": n_hit,
+            "n_miss": n_miss,
+            "n_false": n_false,
+            "pod": n_hit / pod_denominator if pod_denominator else np.nan,
+            "far": n_false / far_denominator if far_denominator else np.nan,
+            "csi": n_hit / csi_denominator if csi_denominator else np.nan,
+            "risk_level_bias": float((forecast - observed).mean()),
+        }
+
+    def write_horizon_results(self, rows):
+        """Append this issue's window rows to out/horizon_window_metrics.csv.
+
+        Appended per issue rather than summarised at the end, like every other
+        results file here, so an interrupted sweep still leaves usable rows.
+        """
+        frame = pd.DataFrame(rows)
+
+        os.makedirs(EXPOSURE_STUDY_RESULTS, exist_ok=True)
+        output_file = os.path.join(EXPOSURE_STUDY_RESULTS, "horizon", HORIZON_METRICS_FILE)
+        # The header is written once, so the columns of this run have to line up
+        # with the file's; see _align_appended_csv for the two ways they can
+        # differ and what each one costs.
+        _align_appended_csv(output_file, frame.columns)
+        frame.to_csv(output_file, mode="a",
+                     header=not os.path.exists(output_file), index=False)
+
+        for row in rows:
+            logger.info(
+                "%s +%dh window (%d steps, %d buildings) %s: "
+                "POD %.2f | FAR %.2f | CSI %.2f | bias %+.2f -> %s",
+                row["issue_time"], row["forecast_horizon"], row["num_steps"],
+                row["n_buildings"], row["configuration"],
+                row["pod"], row["far"], row["csi"],
+                row["risk_level_bias"],
+                HORIZON_METRICS_FILE,
             )
 
     def write_results_simulated(
@@ -412,8 +915,8 @@ class Integrator():
         # not say its own lead cannot be separated from the others afterwards.
         results = {
             "scenario_id":self.scenario_id,
-            "timestamp":timestamp,
-            "valid_time": valid_time,
+            "timestamp":_stamp(timestamp),
+            "valid_time": _stamp(valid_time),
             "lead_h": (
                 None if valid_time is None
                 else (pd.Timestamp(valid_time) - pd.Timestamp(timestamp))
@@ -442,21 +945,12 @@ class Integrator():
 
         output_file = os.path.join("simulated_validation_metrics.csv")
 
-        # Same guard as the binary metrics writer below: the header is written
-        # once, so a run whose columns differ from what is already there would
-        # push its values under the wrong names. Renaming a tier column is
-        # exactly that case. Archive the stale file rather than corrupt it.
-        if os.path.exists(output_file):
-            existing_cols = pd.read_csv(output_file, nrows=0).columns.tolist()
-            if existing_cols != list(df.columns):
-                stamp = time.strftime("%Y%m%d-%H%M%S")
-                archived = f"{os.path.splitext(output_file)[0]}_{stamp}.csv.bak"
-                os.rename(output_file, archived)
-                logger.warning(
-                    f"{os.path.basename(output_file)} had a different column set; "
-                    f"archived it to {os.path.basename(archived)} and started a "
-                    f"new file."
-                )
+        # The header is written once, so a run whose columns differ from what
+        # is already there would push its values under the wrong names. Adding
+        # a configuration to the ablation only widens the schema and the file is
+        # migrated in place; renaming a tier column is the other case, and the
+        # stale file is archived rather than corrupted. See _align_appended_csv.
+        _align_appended_csv(output_file, df.columns)
 
         # Append if file exists
         df.to_csv(
@@ -470,38 +964,27 @@ class Integrator():
     
 
     def compute_metrics(self, gt, pred, object_type="building"):
-        """Agreement between two runs of the SAME exposure method on different
-        flood maps -- the simulated map as ground truth against the flow-matching
-        surrogate's prediction.
-
-        Compared per building, on the depths and on all five tiers the
-        FIS produces: the building's own, its property's, its street's, and the
-        combined risk. Those last three come straight off the building row now
-        that the impact module is building-centred, so no separate road or
-        property frame is needed.
-        """
         id_col = "building_id" if object_type == "building" else "id"
         results = {}
-        tier_columns = {
-            # "ensemble_mean_hazard_level": "ensemble_mean_",
-            "overall_building_hazard_level":"overall_building_hazard_level"
-            # "final_risk_ensemble_mean": "mean_map_",
-        }
-        for column, prefix in tier_columns.items():
-            if column not in gt.columns or column not in pred.columns:
-                continue
-            comparison = gt.merge(
-                pred[[id_col, column]], on=id_col, suffixes=("_gt", "_pred"),
-            )
-            results.update(_fuzzy_indicator_metrics(comparison, column, prefix=prefix))
+        for prefix in CONFIGURATION_PREFIXES:
+            # The ensemble collapsed BEFORE the class: the mean of the members'
+            # aggregated indicators, classified once. Not the pooled vote of the
+            # members' classes, and not the class of the ensemble-mean flood map
+            # -- both of those are on the frame too (see the finder's columns).
+            column = f"{prefix}_ensemble_mean_hazard_level"
+            if column in gt.columns and column in pred.columns:
+                comparison = gt.merge(
+                    pred[[id_col, column]], on=id_col, suffixes=("_gt", "_pred"),
+                )
+                # Only the ordered-agreement number is published. The helper also
+                # returns per-class hit rate and CSI; they are dropped here to
+                # keep the row to the reported set, and restoring them is
+                # `results.update(metrics)` instead of the single key below.
+                metrics = _class_indicator_metrics(comparison, column,
+                                                   prefix=f"{prefix}_")
+                results[f"{prefix}_qwk"] = metrics[f"{prefix}_qwk"]
 
-        # The ensemble's per-tier probabilities, already on the frame from the
-        # FIS -- averaged over buildings only so they survive into the metrics
-        # CSV, which is all a run persists.
-        for term in TERMS + (f"at_least_{TERMS[MIDDLE]}",):
-            column = f"overall_building_hazard_prob_{term}"
-            if column in pred.columns:
-                results[f"prob_{term}"] = float(pred[column].mean())
+            results.update(_exceedance_metrics(gt, pred, id_col, prefix=prefix))
 
         return results
 
@@ -543,36 +1026,29 @@ class Integrator():
         building_impact = next(iter(impact_forecast['building_impact'].values()))
         obs_placard_surveyed = self.get_obs_placard_filtered()  # Load placard data
 
+        # One column set per scored configuration, plus the per-object
+        # diagnostics that explain a row. Built from the registry rather than
+        # listed, so a configuration cannot be scored without its columns being
+        # pulled across (see SCORED_CONFIGURATIONS).
         wanted = [
                     "building_id",
                     "depth_max",
                     "depth_mean",
                     "num_ring_cells",
-                    "inundated",
-                    "building_hazard_level",
-                    "building_hazard_likelihood",
                     "property_known",
-                    "property_hazard_level",
-                    "property_hazard_likelihood",
                     "street_known",
-                    "street_hazard_level",
-                    "street_hazard_likelihood",
-                    "overall_building_hazard_level",
-                    "overall_building_hazard_likelihood",
-                    "overall_building_hazard_prob_H1",
-                    "overall_building_hazard_prob_H2_H3",
-                    "overall_building_hazard_prob_H4_above",
-                    "overall_building_hazard_prob_at_least_H2_H3",
-                    "overall_building_hazard_rule",
-                    "overall_building_hazard_driver",
-                    "overall_building_hazard_bp_level",
-                    "overall_building_hazard_bp_likelihood",
-                    "overall_building_hazard_bp_rule",
-                    "ensemble_mean_hazard_level",
-                    "ensemble_mean_hazard_rule",
-                    "final_risk_ensemble_mean",
-                    "final_risk_ensemble_mean_rule",
-                    "final_risk_level",
+        ] + [
+            f"{prefix}_{suffix}"
+            for prefix in CONFIGURATION_PREFIXES
+            for suffix in ("indicator_mean", "hazard_level", "hazard_class",
+                           "likelihood", "likelihood_class",
+                           "prob_at_least_H2", "prob_at_least_H3_above",
+                           "ensemble_mean_hazard_level",
+                           "mean_map_hazard_level")
+        ] + [
+            f"{object_type}_max_{suffix}"
+            for object_type in ("property", "street")
+            for suffix in ("indicator_mean", "hazard_level", "likelihood")
         ]
         missing = [column for column in wanted if column not in building_impact.columns]
         if missing:
@@ -596,54 +1072,54 @@ class Integrator():
             _damage_to_affected
         )
         
+        # THE SCORED POPULATION. Only the h_max columns are in the subset,
+        # deliberately: contingency tables can only be compared across one
+        # identical population, and every configuration has to be scored on the
+        # rows the h_max pass defines rather than on its own.
         risk_eval = survyed_buildings.dropna(
-            subset=["building_hazard_level", "observed_affected",
-                    "overall_building_hazard_bp_level", "max_depth", "mean_depth"]
+            subset=["observed_affected", "max_depth", "mean_depth",
+                    f"{configuration_prefix('BuildingOnly', 'Max')}_hazard_level",
+                    f"{BUILDPROP_MAX_PREFIX}_hazard_level"]
         ).copy()
         
         y_true = risk_eval["observed_affected"]
         num_buildings = len(risk_eval)
         
         
-        y_pred_building = _hazards_to_affected(risk_eval[["building_hazard_level"]])
-
-
         logger.info(
             f"scored {num_buildings} buildings; inputs available: "
             f"property {int(risk_eval['property_known'].sum())}, "
-            f"street {int(risk_eval['street_known'].sum())} (street not scored)"
+            f"street {int(risk_eval['street_known'].sum())}"
         )
         # Observed class for the same rows, so each indicator's misses and false
         # alarms can be attributed to the damage level they came from.
         damage_levels = risk_eval["DamageNb"]
 
-        self.write_results(num_buildings, y_true, y_pred_building,
-                           "building_hazard_level", model, "July2021",
-                           damage_levels)
+        # THE PAPER CONFIGURATIONS, in SCORED_CONFIGURATIONS order, so the
+        # CSV rows come out in the order the results table reads.
+        #
+        # ONE RULE FOR ALL OF THEM now that no inference stands between the depths
+        # and the class: a building is predicted affected when the ensemble puts
+        # its context indicator at or above the H1/H2 boundary with probability
+        # at least AFFECTED_MIN_PROBABILITY -- P(h >= 0.30 m) >= 0.5 by default.
+        # That is Equation (8) read at the class the warning starts at, and it
+        # is the same question asked of every configuration, which is what makes
+        # the ablation a comparison of spatial contexts rather than of scoring
+        # rules (see AFFECTED_MIN_PROBABILITY for what moving it does).
+        for column in SCORED_CONFIGURATIONS:
+            if column not in risk_eval.columns:
+                logger.info("%s not in the impact frame; not scored", column)
+                continue
+            self.write_results(
+                num_buildings, y_true,
+                _exceedance_to_affected(risk_eval[column]),
+                column, model, "July2021", damage_levels,
+            )
 
-        #Also compute based on h_max, h_mean and the two combined-FIS tiers
-        y_pred_h_max = self.depth_to_affected(risk_eval[["max_depth"]], threshold=0.30)
-        self.write_results(num_buildings, y_true, y_pred_h_max,
-                            "max_depth", model, "July2021", damage_levels)
-
-        y_pred_h_mean = self.depth_to_affected(risk_eval[["mean_depth"]], threshold=0.30)
-        self.write_results(num_buildings, y_true, y_pred_h_mean,
-                            "mean_depth", model, "July2021", damage_levels)
-
-        y_pred_overall = _hazards_to_affected(
-            risk_eval[["overall_building_hazard_level"]])
-        self.write_results(num_buildings, y_true, y_pred_overall,
-                            "overall_building_hazard_level", model, "July2021",
-                            damage_levels)
-
-        y_pred_overall_bp = _hazards_to_affected(
-            risk_eval[["overall_building_hazard_bp_level"]])
-        self.write_results(num_buildings, y_true, y_pred_overall_bp,
-                    "overall_building_hazard_bp_level", model, "July2021",
-                    damage_levels)
-
-        for column in ("ensemble_mean_hazard_level", "final_risk_ensemble_mean",
-                       "final_risk_level"):
+        # The diagnostics: the same scoring applied to readings that are not
+        # configurations -- the ensemble collapsed before the class instead of
+        # after it. Separable from the table by having no paper name.
+        for column in DIAGNOSTIC_COLUMNS:
             if column not in risk_eval.columns:
                 logger.info("%s not in the impact frame; not scored", column)
                 continue
@@ -675,8 +1151,16 @@ class Integrator():
         ``damage_levels`` is the observed DamageNb column for the same rows as
         ``y_true``; passing it adds the per-class miss / false-alarm split
         described in _errors_by_damage_level alongside the overall scores.
+
+        ``indicator`` is passed as the impact-frame COLUMN that was
+        thresholded, and published as the configuration's PAPER NAME where it
+        is one of the paper's (SCORED_CONFIGURATIONS). A column with no paper name
+        is a diagnostic and is published under its own name, with an empty
+        ``indicators_used`` -- so the table is exactly the rows that have one.
         """
         labels = [NOT_AFFECTED, AFFECTED]
+        configuration, indicators_used = SCORED_CONFIGURATIONS.get(
+            indicator, (indicator, ""))
 
         (tn, fp), (fn, tp) = confusion_matrix(y_true, y_pred, labels=labels)
         tn, fp, fn, tp = int(tn), int(fp), int(fn), int(tp)
@@ -696,7 +1180,7 @@ class Integrator():
 
         by_damage = _errors_by_damage_level(y_true, y_pred, damage_levels)
 
-        logger.info(f"Binary verification ({indicator}), affected = DamageNb >= "
+        logger.info(f"Binary verification ({configuration}), affected = DamageNb >= "
                     f"{AFFECTED_DAMAGE_MIN}:")
         logger.info(f"  hits={tp} misses={fn} false_alarms={fp} correct_negatives={tn}")
         if damage_levels is not None:
@@ -720,9 +1204,9 @@ class Integrator():
             "correct_negatives": tn,
             "pod": pod,
             "csi": csi,
-            "buffer_multiplier": self.buffer_m,
             "model": model,
-            "indicator": indicator,
+            "indicator": configuration,
+            "indicators_used": indicators_used,
             **by_damage,
         }
 
@@ -731,20 +1215,10 @@ class Integrator():
         # already appended to risk_matrix_validation_metrics.csv.
         output_file = os.path.join(output_dir, "binary_validation_metrics.csv")
 
-        # The file is appended to with the header written once, so a run whose
-        # columns differ from what is already there would push its values under
-        # the wrong names. Move the stale file aside instead of corrupting it.
-        if os.path.exists(output_file):
-            existing_cols = pd.read_csv(output_file, nrows=0).columns.tolist()
-            if existing_cols != list(metrics_df.columns):
-                stamp = time.strftime("%Y%m%d-%H%M%S")
-                archived = f"{os.path.splitext(output_file)[0]}_{stamp}.csv.bak"
-                os.rename(output_file, archived)
-                logger.warning(
-                    f"{os.path.basename(output_file)} had a different column set "
-                    f"(metrics added or removed); archived it to "
-                    f"{os.path.basename(archived)} and started a new file."
-                )
+        # The header is written once, so the columns of this run have to line
+        # up with the file's; see _align_appended_csv for the two ways they can
+        # differ and what each one costs.
+        _align_appended_csv(output_file, metrics_df.columns)
 
         metrics_df.to_csv(
             output_file,
@@ -781,6 +1255,170 @@ AFFECTED_DAMAGE_MIN = 1
 # CSV whose header is written once: a level set that shrinks when a scenario
 # happens to contain no class-3 building would silently misalign later rows.
 DAMAGE_LEVELS = (0, 1, 2, 3)
+
+# The statistics in ABLATION ORDER, which is not the order they are declared in
+# (hazard_indicator_finder.STATISTICS is keyed by column, not ranked). Every
+# consumer that lays configurations out in rows reads this, so the results
+# table, the prefixes and the CSV cannot come out in three different orders.
+STATISTIC_ORDER = ("Mean", "WetMean", "Max")
+
+# The paper's name for each scored configuration, and the indicators behind it,
+# keyed by the impact-frame column the scoring thresholds -- P(h >= 0.30 m) for
+# that configuration, which is what test_against_placard_data has in hand at the
+# point it calls write_results. Derived from the finder's own CONFIGURATIONS so
+# a context added there cannot be missing here.
+#
+# write_results publishes the paper name in the `indicator` column and the
+# notation in `indicators_used`, so a results table is built from the CSV
+# directly and there is no second mapping to keep in step with this one.
+#
+# Ordered by expanding spatial context (footprint, + property parcel, + adjacent
+# street), and within each context by STATISTIC_ORDER, so the CSV rows come out
+# in the order the table reads. The names are hyphenated to stay unique per row:
+# the paper splits "BuildingOnly" and its indicator across two columns, but a
+# CSV row needs one key.
+#
+# ONLY THE PAPER CONFIGURATIONS ARE HERE. The other scored rows are
+# diagnostics, not configurations, and keep their raw column names so they are
+# trivially separable from the table (see DIAGNOSTIC_COLUMNS).
+SCORED_CONFIGURATIONS = {
+    f"{configuration_prefix(configuration, statistic)}_prob_at_least_H2": (
+        f"{configuration}-{statistic}",
+        ", ".join(f"h_{statistic.lower()}_{object_type[0]}"
+                  for object_type in CONFIGURATIONS[configuration]),
+    )
+    # Statistic inside, and in the order h_mean <= h_wet_mean <= h_max holds
+    # (see hazard_indicator_finder.STATISTICS), so the rows within a context
+    # come out least to most severe -- the order the results table reads.
+    for configuration in CONFIGURATIONS
+    for statistic in STATISTIC_ORDER
+}
+
+# The probability at which the exceedance of the H1/H2 boundary is called a
+# warning. 0.5 is a majority of the ensemble: the class the members agree on
+# more often than not.
+#
+# THIS IS THE BINARY SCORING RULE OF THE ABLATION TABLE, and it is a choice, not
+# a reading of the guideline -- the risk matrix itself places a building at the
+# highest class it reaches and reports the likelihood separately rather than
+# collapsing the two into one call. Lowering it towards 0 scores the matrix's
+# own placement (any member reaching H2 counts), which raises POD and FAR
+# together; the likelihood bands of hazard_indicator_finder are the operational
+# reading of the same axis and are unaffected either way.
+AFFECTED_MIN_PROBABILITY = 0.5
+
+# Column prefixes of every configuration, in the order the table reads them.
+CONFIGURATION_PREFIXES = tuple(
+    configuration_prefix(configuration, statistic)
+    for configuration in CONFIGURATIONS
+    for statistic in STATISTIC_ORDER
+)
+
+# Scored beside them but not part of the table: the same BuildProp-Max and
+# BuildPropStreet-Max contexts with the ensemble collapsed BEFORE the class
+# instead of after it -- the mean of the members' aggregated indicators, and the
+# indicator read off the ensemble-mean flood map. They answer "does reading the
+# ensemble probabilistically buy anything", which is a different question from
+# which spatial context to use.
+DIAGNOSTIC_COLUMNS = (
+    f"{BUILDPROP_MAX_PREFIX}_ensemble_mean_hazard_level",
+    f"{BUILDPROP_MAX_PREFIX}_mean_map_hazard_level",
+    f"{REPORTED_PREFIX}_ensemble_mean_hazard_level",
+    f"{REPORTED_PREFIX}_mean_map_hazard_level",
+)
+
+
+def _configuration_name(prefix):
+    """``(paper name, indicators)`` for a configuration's column prefix.
+
+    Read out of SCORED_CONFIGURATIONS rather than rebuilt, so a results row
+    names its configuration exactly the way the binary table does and there is
+    no second mapping to keep in step. A prefix with no paper name -- a
+    diagnostic -- publishes under its own name with no indicator notation, the
+    same convention write_results follows.
+    """
+    return SCORED_CONFIGURATIONS.get(
+        f"{prefix}_prob_at_least_{CLASS_COLUMN_TERMS[MIDDLE_CLASS]}", (prefix, ""))
+
+
+def _take_columns(frame, columns):
+    """``frame`` narrowed to the columns it actually has, in the given order.
+
+    Whichever of them are missing is reported by the caller against the
+    concatenated frame, so a configuration that is not on the frames is skipped
+    with its name said once rather than raising here per step.
+    """
+    seen, wanted = set(), []
+    for column in columns:
+        if column in frame.columns and column not in seen:
+            seen.add(column)
+            wanted.append(column)
+    return frame[wanted]
+
+
+# Which object series each peak layer collapses, and the id it is keyed on.
+PEAK_LAYERS = {
+    "building_impact": ("building_peak", "building_id"),
+    "road_impact": ("road_peak", "id"),
+    "property_impact": ("property_peak", "unit_of_property_id"),
+}
+
+
+def _window_peak_frames(impact_forecast, issue_time):
+    """The peak layers' frames for one issue, ready to publish.
+
+    Each is a ONE-entry series keyed by the issue time rather than by a valid
+    time, because the peak is a property of the window and not of an hour --
+    which is also what lets the publisher treat these like any other layer. The
+    hour the peak is reached travels as the peak_valid_time COLUMN.
+
+    Built only when the forecast is being published: nothing else reads them,
+    and the collapse is a pass over every step of the window.
+    """
+    peaks = {}
+    for source, (key, id_column) in PEAK_LAYERS.items():
+        frame = window_peak(impact_forecast.get(source) or {}, id_column)
+        if frame is None:
+            continue
+        peaks[key] = {pd.Timestamp(issue_time): frame}
+        logger.info("%s: %d objects collapsed to their window peak",
+                    key, len(frame))
+    return peaks
+
+
+def _window_peak(observed, forecast, level_column, likelihood_column):
+    """Collapse a window's per-step rows to one class per building, per side.
+
+    Both sides take the MAX class over the window's steps. On the forecast side
+    the likelihood has to come from a step that actually REACHED that class --
+    it is P of the class assigned, so the likelihood of a lesser step is a
+    different quantity -- which is why the row is selected rather than the two
+    columns aggregated apart. Sorting by (class, likelihood) and keeping each
+    building's last row gives the highest class, and among the steps that
+    reached it the highest likelihood: the strongest statement the forecast made
+    at the class it is scored on.
+
+    NaNs sort FIRST, so a step whose likelihood could not be evaluated cannot
+    win a tie against one that could; a building whose likelihoods are all NaN
+    still reports NaN.
+
+    Returns a frame indexed by building_id with ``observed``, ``forecast`` and
+    ``likelihood``, on the buildings that carry a class on both sides.
+    """
+    peak_observed = observed.groupby("building_id")[level_column].max()
+    peak_forecast = (
+        forecast
+        .sort_values([level_column, likelihood_column], na_position="first")
+        .groupby("building_id", sort=False)
+        .tail(1)
+        .set_index("building_id")
+    )
+    window = pd.DataFrame({
+        "observed": peak_observed,
+        "forecast": peak_forecast[level_column],
+        "likelihood": peak_forecast[likelihood_column],
+    })
+    return window.dropna(subset=["observed", "forecast"])
 
 
 def _errors_by_damage_level(y_true, y_pred, damage_levels):
@@ -843,20 +1481,40 @@ def _damage_to_affected(damage_nb):
         return AFFECTED
     raise Exception
 
+def _exceedance_to_affected(probability, threshold=None):
+    """Collapse a configuration's P(h >= 0.30 m) to affected / not_affected.
+
+    The binary counterpart of the risk matrix: the matrix reports a class and
+    its likelihood separately, and a contingency table needs the two crossed
+    into one call. Affected when at least ``threshold`` of the ensemble puts the
+    context indicator at or above the H1/H2 boundary
+    (see AFFECTED_MIN_PROBABILITY).
+
+    A NaN probability -- a building the configuration could not be evaluated for
+    -- returns NaN and drops out of the scoring rather than counting as a
+    negative.
+    """
+    threshold = AFFECTED_MIN_PROBABILITY if threshold is None else threshold
+    probability = pd.Series(probability)
+    predicted = pd.Series(
+        np.where(probability >= threshold, AFFECTED, NOT_AFFECTED),
+        index=probability.index, dtype=object,
+    )
+    return predicted.mask(probability.isna())
+
+
 def _hazards_to_affected(levels):
-    """Collapse one or more predicted FIS tier columns to affected/not_affected.
+    """Collapse one or more predicted hazard-class columns to affected/not_affected.
 
-    ``levels`` is a frame of tier columns (1/2/3, NaN where the object had no
-    such link). Medium (2) and high (3) are the tiers that carry a warning, so
-    a row is predicted affected if ANY column is above low; low (1) in every
-    column is the negative. The placard scoring passes a single already-
-    combined tier, so the OR only bites if several columns are handed in.
+    ``levels`` is a frame of hazard-class columns (1/2/3, NaN where the class
+    could not be evaluated). H2 and H3+ are the classes that carry a warning, so
+    a row is predicted affected if ANY column is above H1; H1 in every column is
+    the negative. The scoring passes a single already-aggregated class, so the
+    OR only bites if several columns are handed in.
 
-    NaN tiers contribute nothing rather than voting "not affected": an object
-    that was never assessed is not evidence of a dry surrounding, the same
-    reasoning that marginalises it out of the combined FIS
-    (see overall_building_hazard).
-    A row whose columns are all NaN returns NaN and drops out of the scoring.
+    NaN classes contribute nothing rather than voting "not affected": an object
+    that was never assessed is not evidence of a dry surrounding. A row whose
+    columns are all NaN returns NaN and drops out of the scoring.
     """
     levels = pd.DataFrame(levels)
     # NaN > 1 is False, so unknown tiers fall out of the OR on their own.
@@ -939,12 +1597,144 @@ def _indicator_metrics(comparison, depth_mean_col, depth_max_col, risk_mean_col,
     return results
 
 
-def _fuzzy_indicator_metrics(comparison, risk_col, prefix="fuzzy_"):
-    """QWK/hit-rate/CSI for a single-valued risk indicator (the fuzzy risk
-    tier), given an already-merged (``_gt``/``_pred`` suffixed) comparison
-    frame. Counterpart to _indicator_metrics for the fuzzy classifier, which
-    -- unlike the crisp max/mean design -- produces one joint risk tier per
-    building rather than a mean/max pair, and no depth RMSE of its own.
+# The K-1 thresholds an ordered K-class forecast needs, for one configuration.
+# P(>= H1) carries no information (every building is at least H1), so the
+# distribution is fully described by the exceedance of the two INTERIOR
+# boundaries.
+def exceedance_prob_columns(prefix):
+    return tuple(f"{prefix}_prob_at_least_{term}"
+                 for term in CLASS_COLUMN_TERMS[MIDDLE_CLASS:])
+
+
+# All three, including P(>= H1). That one is not part of the score -- every
+# building is at least H1, so it adds nothing to the distribution -- but it is
+# the share of the ensemble putting ANY water in the building's spatial context,
+# which is worth reporting in its own right.
+def all_exceedance_columns(prefix):
+    return tuple(f"{prefix}_prob_at_least_{term}" for term in CLASS_COLUMN_TERMS)
+
+
+def _rps_from_cumulative(cumulative, observed):
+    """Ranked probability score per row, for an ordered categorical forecast.
+
+        RPS = sum_k (F_k - O_k)^2,    k = 1 .. K-1
+
+    with F_k the forecast probability of class <= k and O_k the observed
+    indicator. Summing the SQUARED CUMULATIVE error rather than the per-class
+    error is what makes the score respect the ordering: putting the mass on H1
+    when H3+ verified is penalised twice as hard as putting it on H2.
+
+    It is a proper score, so it is minimised by reporting the forecast actually
+    believed -- a hedged distribution cannot beat an honest one. And it reduces
+    to |c - y| for a deterministic forecast (all mass on one class), which is
+    what lets a point forecast and an ensemble be scored in the same units and
+    put in the same table.
+
+    ``cumulative`` is (n, K-1) and ``observed`` the (n,) integer class.
+    """
+    observed_cumulative = np.stack(
+        [observed <= level for level in HAZARD_LEVELS[:-1]], axis=1
+    ).astype(float)
+    return ((np.asarray(cumulative, dtype=float) - observed_cumulative) ** 2).sum(axis=1)
+
+
+def _skill(score, reference):
+    """1 - score/reference, NaN where the reference is perfect.
+
+    A reference RPS of 0 means the reference forecast was already exactly right
+    on every row -- a timestep where every building is dry, which is most of
+    them at the start and end of an event. There is no skill to express over a
+    perfect reference, so the row reports NaN rather than an infinity that
+    would poison any later average.
+    """
+    return np.nan if reference <= 0 else float(1.0 - score / reference)
+
+
+def _exceedance_metrics(gt, pred, id_col, prefix=None):
+    """Probabilistic verification of one configuration's exceedance probabilities.
+
+    The forecast is a DISTRIBUTION over the three hazard classes, published as
+    the exceedance of the two interior boundaries; the truth is the class the
+    same configuration assigns to the simulated map. Scoring a probability
+    against a class is what RPS is for -- the deterministic QWK beside it can
+    only see the collapsed class and is blind to the ensemble's spread entirely.
+
+    ONE reference: the same configuration's ``ensemble_mean_hazard_level``, its
+    mean-of-maxima class, scored as a degenerate distribution (all mass on one
+    class, at which point the RPS reduces to |c - y|). RPS is an absolute score
+    whose magnitude depends on the class base rates and means nothing on its
+    own, so it needs a reference -- and this is the one the method's claim is
+    actually about: does reading the ensemble probabilistically beat collapsing
+    it before classifying. It is also EXACTLY the forecast the QWK column
+    scores, so the two figures are two readings of one pair of forecasts rather
+    than of two different ones.
+
+    NO CLIMATOLOGY REFERENCE. A climatology would have to be built from a
+    historical archive of outcomes, which this pipeline does not have; taking
+    the base rates of the very rows being scored instead is an in-sample
+    construct that is not a climatology in the sense the verification
+    literature uses the word, and reporting it under that name invites exactly
+    the wrong comparison.
+
+    The RAW scores are recorded alongside the skill, because RPSS does not
+    average: pooling timesteps means summing the numerators and denominators
+    separately, which needs rps, its reference and n, not the ratio.
+    """
+    prefix = BUILDPROP_MAX_PREFIX if prefix is None else prefix
+    observed_column = f"{prefix}_hazard_level"
+    reference_column = f"{prefix}_ensemble_mean_hazard_level"
+
+    wanted = list(all_exceedance_columns(prefix)) + [reference_column]
+    missing = ([observed_column] if observed_column not in gt.columns else []) + [
+        column for column in wanted if column not in pred.columns]
+    if missing:
+        logger.info("no exceedance metrics for %s; the frames lack %s",
+                    prefix, missing)
+        return {}
+
+    merged = gt[[id_col, observed_column]].merge(
+        pred[[id_col] + wanted], on=id_col).dropna(
+        subset=[observed_column] + wanted)
+    if merged.empty:
+        return {}
+
+    observed = merged[observed_column].to_numpy(dtype=int)
+    # P(>=H2), P(>=H3+)
+    exceedance = merged[list(exceedance_prob_columns(prefix))].to_numpy(dtype=float)
+    # P(class <= k) is the complement of P(class >= k+1); the columns are
+    # already ordered by boundary, so this is the cumulative the score wants.
+    rps = _rps_from_cumulative(1.0 - exceedance, observed).mean()
+
+    point = merged[reference_column].to_numpy(dtype=int)
+    ensemble_mean = _rps_from_cumulative(
+        np.stack([point <= level for level in HAZARD_LEVELS[:-1]], axis=1),
+        observed,
+    ).mean()
+
+    results = {
+        f"{prefix}_n": int(len(merged)),
+        f"{prefix}_rps": float(rps),
+        f"{prefix}_rps_ensemble_mean": float(ensemble_mean),
+        f"{prefix}_rpss_ensemble_mean": _skill(rps, ensemble_mean),
+    }
+    # The exceedance probabilities themselves, averaged over buildings -- the
+    # only form in which a per-building quantity survives into a metrics CSV.
+    # Taken on the MERGED rows, so every number in the row describes the same
+    # population as the scores beside it.
+    for term in CLASS_COLUMN_TERMS:
+        results[f"{prefix}_prob_at_least_{term}"] = float(
+            merged[f"{prefix}_prob_at_least_{term}"].mean())
+    return results
+
+
+def _class_indicator_metrics(comparison, risk_col, prefix="class_"):
+    """QWK/hit-rate/CSI for a single-valued hazard class, given an
+    already-merged (``_gt``/``_pred`` suffixed) comparison frame.
+
+    Counterpart to _indicator_metrics, which scores a mean/max PAIR of depth
+    columns and their classes. A configuration produces ONE class per building
+    -- its objects have already been aggregated by Equation (7) -- so there is
+    one column to score and no depth RMSE of its own.
     """
     comparison = comparison.dropna(
         subset=[f"{risk_col}_gt", f"{risk_col}_pred"]
@@ -965,4 +1755,3 @@ def _fuzzy_indicator_metrics(comparison, risk_col, prefix="fuzzy_"):
         results[f"{prefix}csi_{label}"] = hit_csi[label]["csi"]
 
     return results
-

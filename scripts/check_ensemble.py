@@ -22,11 +22,11 @@ from modules.lib import (
     AUTO_ENCODER,
     AUTO_ENCODER_DECODER,
 )
-from modules.hazard_forecast_module.ensemble_client import (
+from modules.hazard_module.ensemble_client import (
     LatentFlowEnsemble,
     select_providers,
 )
-from modules.hazard_forecast_module.spatial_sampler.latent_canvas import LatentCanvas
+from modules.hazard_module.spatial_sampler.latent_canvas import LatentCanvas
 
 warnings.filterwarnings("ignore")
 logging.basicConfig(level=logging.WARNING)

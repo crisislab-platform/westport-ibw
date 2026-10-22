@@ -1,0 +1,14 @@
+scenario_id,timestamp,num_buildings_evaluated,damage_threshold,number_affected,number_not_affected,hits,misses,false_alarms,correct_negatives,pod,csi,model,indicator,indicators_used,n_damage_0,misses_damage_0,false_alarms_damage_0,n_damage_1,misses_damage_1,false_alarms_damage_1,n_damage_2,misses_damage_2,false_alarms_damage_2,n_damage_3,misses_damage_3,false_alarms_damage_3
+0,July2021,2247,1,649,1598,449,200,200,1398,0.6918335901386748,0.5288574793875147,surveyed,BuildingOnly-Mean,h_mean_b,1598,0,200,179,104,0,356,86,0,114,10,0
+0,July2021,2247,1,649,1598,468,181,267,1331,0.7211093990755008,0.5109170305676856,surveyed,BuildingOnly-WetMean,h_wetmean_b,1598,0,267,179,97,0,356,75,0,114,9,0
+0,July2021,2247,1,649,1598,585,64,600,998,0.901386748844376,0.46837469975980783,surveyed,BuildingOnly-Max,h_max_b,1598,0,600,179,40,0,356,20,0,114,4,0
+0,July2021,2247,1,649,1598,467,182,259,1339,0.7195685670261941,0.51431718061674,surveyed,BuildProp-Mean,"h_mean_b, h_mean_p",1598,0,259,179,96,0,356,80,0,114,6,0
+0,July2021,2247,1,649,1598,501,148,371,1227,0.7719568567026194,0.49117647058823527,surveyed,BuildProp-WetMean,"h_wetmean_b, h_wetmean_p",1598,0,371,179,81,0,356,63,0,114,4,0
+0,July2021,2247,1,649,1598,609,40,738,860,0.938366718027735,0.4390771449170872,surveyed,BuildProp-Max,"h_max_b, h_max_p",1598,0,738,179,28,0,356,10,0,114,2,0
+0,July2021,2247,1,649,1598,539,110,513,1085,0.8305084745762712,0.463855421686747,surveyed,BuildPropStreet-Mean,"h_mean_b, h_mean_p, h_mean_s",1598,0,513,179,58,0,356,48,0,114,4,0
+0,July2021,2247,1,649,1598,563,86,647,951,0.8674884437596302,0.43441358024691357,surveyed,BuildPropStreet-WetMean,"h_wetmean_b, h_wetmean_p, h_wetmean_s",1598,0,647,179,52,0,356,31,0,114,3,0
+0,July2021,2247,1,649,1598,634,15,1030,568,0.9768875192604006,0.3776057176891007,surveyed,BuildPropStreet-Max,"h_max_b, h_max_p, h_max_s",1598,0,1030,179,12,0,356,2,0,114,1,0
+0,July2021,2247,1,649,1598,609,40,738,860,0.938366718027735,0.4390771449170872,surveyed,buildprop_max_ensemble_mean_hazard_level,,1598,0,738,179,28,0,356,10,0,114,2,0
+0,July2021,2247,1,649,1598,609,40,738,860,0.938366718027735,0.4390771449170872,surveyed,buildprop_max_mean_map_hazard_level,,1598,0,738,179,28,0,356,10,0,114,2,0
+0,July2021,2247,1,649,1598,634,15,1030,568,0.9768875192604006,0.3776057176891007,surveyed,buildpropstreet_max_ensemble_mean_hazard_level,,1598,0,1030,179,12,0,356,2,0,114,1,0
+0,July2021,2247,1,649,1598,634,15,1030,568,0.9768875192604006,0.3776057176891007,surveyed,buildpropstreet_max_mean_map_hazard_level,,1598,0,1030,179,12,0,356,2,0,114,1,0

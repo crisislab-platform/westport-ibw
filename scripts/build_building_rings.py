@@ -37,7 +37,7 @@ if PROJECT_ROOT not in sys.path:
 
 import rasterio
 
-from modules.impact_module.impact_module import (
+from modules.impact_module.risk_module import (
     GROWTH_STEP_PCT, MAX_BUFFER_PCT, MIN_RING_CELLS, ImpactModule,
 )
 from modules.lib import SURVEYED_FLOOD_DEPTH_JUL_2021

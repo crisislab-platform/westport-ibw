@@ -24,12 +24,15 @@ import pandas as pd
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from modules.arcgis_module.arcgis_module import (  # noqa: E402
+from modules.update_module.arcgis_module import (  # noqa: E402
     BUILDING_FIELDS, ROAD_FIELDS, PROPERTY_FIELDS, FLOOD_EXTENT_FIELDS,
-    INUNDATION_GRID_FIELDS,
+    INUNDATION_GRID_FIELDS, BUILDING_PEAK_FIELDS, ROAD_PEAK_FIELDS,
+    PROPERTY_PEAK_FIELDS,
 )
-from modules.impact_module.impact_module import (  # noqa: E402
-    ImpactModule, DEPTH_BREAKS_M, FLOOD_EXTENT_BANDS, INUNDATION_BLOCK,
+# RiskModule in modules.risk_module as of the 2026-08 refactor; this script
+# still imported ImpactModule from modules.impact_module and could not run.
+from modules.risk_module.risk_module import (  # noqa: E402
+    RiskModule, DEPTH_BREAKS_M, FLOOD_EXTENT_BANDS, INUNDATION_BLOCK,
     WET_DEPTH_MIN,
 )
 from modules.lib import OUTPUT_DIR  # noqa: E402
@@ -40,31 +43,33 @@ logger = logging.getLogger("make_layer_schemas")
 # Placeholder values by field. Integer tiers stay integers and probabilities
 # stay doubles so AGOL types them apart; strings get a non-empty value because
 # an empty one can come back as null and be typed as something else.
-_INT_FIELDS = {"overall_building_hazard_level", "overall_hazard_level",
-               "final_risk_level", "building_hazard_level",
-               "property_hazard_level", "street_hazard_level", "depth_class",
-               "ensemble_mean_hazard_level", "final_risk_ensemble_mean"}
-_STR_FIELDS = {"overall_building_hazard_rule",
-               "overall_building_hazard_driver",
-               "band"}
+# Every hazard class and likelihood band is an ordinal level; matched by suffix
+# rather than listed, since the same names appear once per configuration prefix
+# on the building layer (see arcgis_module.BUILDING_FIELDS).
+_INT_SUFFIXES = ("hazard_level", "likelihood_level", "risk_level")
+_INT_FIELDS = {"depth_class"}
+_STR_SUFFIXES = ("hazard_class", "likelihood_class")
+_STR_FIELDS = {"band"}
 _BOOL_FIELDS = {"property_known", "street_known"}
-_TIME_FIELDS = {"issue_time", "valid_time"}
+_TIME_FIELDS = {"issue_time", "valid_time", "peak_valid_time"}
 
-# Long enough for the values actually written (colours, rule labels like "R5",
-# drivers like "structure") with room to spare -- AGOL sizes a string field
-# from the sample and will truncate later pushes that outgrow it.
-_STRING_PLACEHOLDER = "unset"
+# AGOL sizes a string field from the sample it is given and truncates later
+# pushes that outgrow it, so the placeholder has to be at least as long as the
+# longest real value: "Very Likely", 11 characters, since the likelihood bands
+# were renamed to the paper's terms. "unset" (5) would have sized the field
+# short enough to clip every Very Likely and Unlikely band pushed afterwards.
+_STRING_PLACEHOLDER = "placeholder"
 _EPOCH = pd.Timestamp("1970-01-01T00:00:00")
 
 
 def _placeholder(field):
     if field in _TIME_FIELDS:
         return _EPOCH
-    if field in _STR_FIELDS:
+    if field in _STR_FIELDS or field.endswith(_STR_SUFFIXES):
         return _STRING_PLACEHOLDER
     if field in _BOOL_FIELDS:
         return False
-    if field in _INT_FIELDS:
+    if field in _INT_FIELDS or field.endswith(_INT_SUFFIXES):
         return 0
     return 0.0
 
@@ -192,47 +197,48 @@ def main():
     # Loading the impact module is what selects the modelled objects: the
     # building link table decides which buildings, parcels and road parcels are
     # in play, and the layers must hold exactly those.
-    impact_module = ImpactModule(args.scenario_id)
+    # min_exceed_prob does not affect an all-placeholder schema, but the
+    # constructor requires it; 0.1 is what the sweeps run with.
+    impact_module = RiskModule(args.scenario_id, 0.1)
 
     for name, objects, fields, id_field in (
         ("buildings", impact_module.buildings, BUILDING_FIELDS, "building_id"),
         ("roads", impact_module.roads, ROAD_FIELDS, "id"),
         ("properties", impact_module.properties, PROPERTY_FIELDS, "unit_of_property_id"),
+        # The peak layers: the same objects and geometry, one row each, carrying
+        # the window collapse instead of an hour.
+        ("buildings_peak", impact_module.buildings, BUILDING_PEAK_FIELDS,
+         "building_id"),
+        ("roads_peak", impact_module.roads, ROAD_PEAK_FIELDS, "id"),
+        ("properties_peak", impact_module.properties, PROPERTY_PEAK_FIELDS,
+         "unit_of_property_id"),
     ):
         frame = build_schema_frame(objects, fields, id_field)
-        for column in _TIME_FIELDS:
+        # Intersected, not iterated whole: an hourly frame has no
+        # peak_valid_time and a peak frame has no valid_time.
+        for column in _TIME_FIELDS.intersection(frame.columns):
             frame[column] = pd.to_datetime(frame[column]).dt.strftime("%Y-%m-%dT%H:%M:%S")
 
         path = os.path.join(args.output_dir, f"{name}_schema.geojson")
         frame.to_file(path, driver="GeoJSON")
         logger.info("Wrote %s: %d features, %d fields", path, len(frame), len(fields))
 
-    raster_path = args.flood_map or find_latest_flood_map()
-    if raster_path:
-        frame = build_flood_extent_schema(impact_module, raster_path)
-        for column in _TIME_FIELDS:
-            frame[column] = pd.to_datetime(frame[column]).dt.strftime("%Y-%m-%dT%H:%M:%S")
-        path = os.path.join(args.output_dir, "flood_extent_schema.geojson")
-        frame.to_file(path, driver="GeoJSON")
-        logger.info(
-            "Wrote %s: %d features, %d fields (geometry from %s)",
-            path, len(frame), len(FLOOD_EXTENT_FIELDS), raster_path,
-        )
-
-        frame = build_inundation_grid_schema(impact_module, raster_path)
-        for column in _TIME_FIELDS:
-            frame[column] = pd.to_datetime(frame[column]).dt.strftime("%Y-%m-%dT%H:%M:%S")
-        path = os.path.join(args.output_dir, "inundation_grid_schema.geojson")
-        frame.to_file(path, driver="GeoJSON")
-        logger.info(
-            "Wrote %s: %d features, %d fields (geometry from %s)",
-            path, len(frame), len(INUNDATION_GRID_FIELDS), raster_path,
-        )
-    else:
-        logger.warning(
-            "no flood_map_*.tif under %s, so the flood extent schema was skipped; "
-            "run a forecast first, or pass --flood-map", OUTPUT_DIR,
-        )
+    # The flood-extent and inundation-grid schemas are PAUSED as of 2026-08-27:
+    # neither layer is needed, and neither can be built anyway. Both builders
+    # call methods that stayed in fuzzy_risk_back.py through the refactor and
+    # are not on RiskModule -- _depth_band_polygons for the extent, _block_grid
+    # for the grid. Restoring those two methods, and the LAYERS entries in
+    # arcgis_module, is what un-pauses this:
+    #
+    #     raster_path = args.flood_map or find_latest_flood_map()
+    #     if raster_path:
+    #         frame = build_flood_extent_schema(impact_module, raster_path)
+    #         ... write flood_extent_schema.geojson ...
+    #         frame = build_inundation_grid_schema(impact_module, raster_path)
+    #         ... write inundation_grid_schema.geojson ...
+    #
+    # build_flood_extent_schema, build_inundation_grid_schema, the --flood-map
+    # argument and find_latest_flood_map are left in place for that.
 
     logger.info(
         "Upload each file to ArcGIS Online to create the layer, then TRUNCATE it "

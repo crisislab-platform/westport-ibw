@@ -1,0 +1,10 @@
+configuration,hazard_class_column,false_alarms,n_H1,pct_H1,n_H2,pct_H2,n_H3+,pct_H3+
+BuildingOnly-Mean,buildingonly_mean_hazard_class,200,0,0.0,161,80.5,39,19.5
+BuildingOnly-WetMean,buildingonly_wetmean_hazard_class,267,0,0.0,218,81.6,49,18.4
+BuildingOnly-Max,buildingonly_max_hazard_class,600,0,0.0,309,51.5,291,48.5
+BuildProp-Mean,buildprop_mean_hazard_class,259,0,0.0,195,75.3,64,24.7
+BuildProp-WetMean,buildprop_wetmean_hazard_class,371,0,0.0,270,72.8,101,27.2
+BuildProp-Max,buildprop_max_hazard_class,738,0,0.0,285,38.6,453,61.4
+BuildPropStreet-Mean,buildpropstreet_mean_hazard_class,513,0,0.0,302,58.9,211,41.1
+BuildPropStreet-WetMean,buildpropstreet_wetmean_hazard_class,647,0,0.0,338,52.2,309,47.8
+BuildPropStreet-Max,buildpropstreet_max_hazard_class,1030,0,0.0,238,23.1,792,76.9

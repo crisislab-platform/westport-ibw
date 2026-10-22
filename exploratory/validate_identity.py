@@ -18,8 +18,8 @@ import numpy as np
 import pandas as pd
 import torch
 
-from modules.bc_forecast_module.bc_module import BC_Module
-from modules.impact_module.impact_module import ImpactModule
+from modules.data_module.bc_module import BC_Module
+from modules.impact_module.risk_module import ImpactModule
 from modules.forecast_runner.forecast_runner import Integrator
 from modules.utils.spatial_operators.operators import load_flood_map
 
@@ -76,14 +76,14 @@ def main(scenario_id=57, n_timesteps=6):
 
     d = pd.DataFrame(captured)
     cols = [c for c in ("valid", "n", "n_wet_gt", "depth_max_bias_wet",
-                        "depth_max_rmse_wet", "ensemble_mean_qwk",
-                        "ensemble_mean_hit_rate_Red") if c in d.columns]
+                        "depth_max_rmse_wet", "ensemble_mean_bp_qwk",
+                        "ensemble_mean_bp_hit_rate_Red") if c in d.columns]
     print(d[cols].to_string(index=False))
 
     print("\n-- identity checks --")
     ok = True
-    if "ensemble_mean_qwk" in d:
-        q = d.ensemble_mean_qwk
+    if "ensemble_mean_bp_qwk" in d:
+        q = d["ensemble_mean_bp_qwk"]
         ok &= bool(np.allclose(q.dropna(), 1.0))
         print(f"  qwk == 1.0 everywhere         : {np.allclose(q.dropna(), 1.0)}"
               f"   (min {q.min():.6f})")

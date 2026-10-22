@@ -30,6 +30,7 @@ def parse_args():
                         help="K -- samples drawn per ensemble member")
     parser.add_argument("--num_deep_ensemble", type=int, default=10,
                         help="M -- members of the deep ensemble to load")
+    parser.add_argument("--exceedence_prob", type=float, default=10, help="Min exeedence probability of the lower bound of hazard claass")
     return parser.parse_args()
 
 
@@ -47,10 +48,10 @@ if __name__ == "__main__":
         exit(1)
 
     if args.command == RUN_COMMAND:
-        integrator = Integrator(args.scenario_id, args.forecast_horizon, args.push_to_arcgis, args.samples_per_member, args.num_deep_ensemble)
+        integrator = Integrator(args.scenario_id, args.forecast_horizon, args.push_to_arcgis, args.samples_per_member, args.num_deep_ensemble, args.exceedence_prob)
         integrator.run_hourly_forecast(start_time=args.start_time, end_time=args.end_time)
     elif args.command == TEST_COMMAND:
-        integrator = Integrator(args.scenario_id, args.forecast_horizon, False,args.samples_per_member, args.num_deep_ensemble)
+        integrator = Integrator(args.scenario_id, args.forecast_horizon, False,args.samples_per_member, args.num_deep_ensemble, min_exceed_prob=args.exceedence_prob)
         integrator.validate_forecast(args.start_time, args.end_time)
     logger.info("Commands executed successfully")
 

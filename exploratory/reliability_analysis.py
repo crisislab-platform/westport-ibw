@@ -1,9 +1,10 @@
-"""Calibration of the ensemble's tier probabilities against simulated truth.
+"""Calibration of the ensemble's exceedance probabilities against simulated truth.
 
-The pipeline reports P(tier) as the share of ensemble members electing that
-tier, and warns when an exceedance probability clears a threshold
-(fuzzy_risk.final_risk). That makes the numbers ACT like probabilities, but
-nothing so far has shown they ARE ones: a forecast of 0.7 is only a probability
+The pipeline reports P(h >= tau_A) as the share of ensemble members whose
+context indicator reaches that class's lower bound
+(hazard_indicator_finder, Equation 8), and puts the building on the likelihood
+axis of the risk matrix with it. That makes the numbers ACT like probabilities,
+but nothing so far has shown they ARE ones: a forecast of 0.7 is only a probability
 if the event happens about 70% of the time when 0.7 is issued. This script is
 that check.
 
@@ -16,8 +17,8 @@ the diagonal, with the extreme bins pulled toward the middle.
 Two events are scored, both taken from the exceedance axis the warning
 decision actually reads:
 
-  at_least_H2_H3   P(tier >= medium) vs. the simulated tier reaching medium
-  H4_above         P(tier == severe) vs. the simulated tier being severe
+  at_least_H2      P(tier >= medium) vs. the simulated tier reaching medium
+  H3_above         P(tier == severe) vs. the simulated tier being severe
 
 Note the truth here is the reference SIMULATION's tier, not the surveyed
 placards -- error_hotspots.csv pairs each building's ensemble probabilities
@@ -46,6 +47,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
+from modules.impact_module.risk_module import REPORTED_PREFIX
+
 OUT = f"{PROJECT_ROOT}/out"
 HOTSPOTS = f"{OUT}/error_hotspots.csv"
 
@@ -65,7 +68,7 @@ BOOTSTRAP_SEED = 20260816
 # Categorical slots 1 and 2 of the reference data-viz palette, used unmodified.
 # The palette documents this pair as clearing the CVD and normal-vision floors
 # in light mode on both the adjacent and all-pairs lists.
-SERIES = {"at_least_H2_H3": "#2a78d6", "H4_above": "#eb6834"}
+SERIES = {"at_least_H2": "#2a78d6", "H3_above": "#eb6834"}
 
 # Ink and furniture. Text never wears the series colour -- the marks carry
 # identity, the labels stay in neutral ink.
@@ -74,16 +77,21 @@ INK_MUTED = "#52514e"
 GRID = "#d8d7d2"
 SURFACE = "#fcfcfb"
 
+# The probability columns of the reported configuration, as
+# map_error_hotspots.py writes them into error_hotspots.csv. Both events are
+# EXCEEDANCES now -- P(h >= 0.30 m) and P(h >= 0.50 m) -- so the second one is
+# "reaches H3+", not "is exactly H3+"; the truth function matches, since the
+# reference reaching class 3 is exactly its indicator clearing 0.50 m.
 EVENTS = {
-    "at_least_H2_H3": {
-        "prob": "overall_building_hazard_prob_at_least_H2_H3",
-        "label": "P(tier ≥ medium)",
+    "at_least_H2": {
+        "prob": f"{REPORTED_PREFIX}_prob_at_least_H2",
+        "label": "P(h ≥ 0.30 m, H2)",
         "truth": lambda gt: (gt >= 2).astype(float),
     },
-    "H4_above": {
-        "prob": "overall_building_hazard_prob_H4_above",
-        "label": "P(tier = severe)",
-        "truth": lambda gt: (gt == 3).astype(float),
+    "H3_above": {
+        "prob": f"{REPORTED_PREFIX}_prob_at_least_H3_above",
+        "label": "P(h ≥ 0.50 m, H3+)",
+        "truth": lambda gt: (gt >= 3).astype(float),
     },
 }
 
@@ -188,7 +196,7 @@ def cluster_bootstrap(frame, prob_column, truth, cluster_column,
         pick = rng.integers(0, len(grouped), size=len(grouped))
         sample = pd.concat([grouped[i] for i in pick], ignore_index=True)
         prob = sample[prob_column].to_numpy(dtype=float)
-        obs = truth(sample["overall_building_hazard_level_gt"].to_numpy())
+        obs = truth(sample[f"{REPORTED_PREFIX}_hazard_level_gt"].to_numpy())
         base_rate = obs.mean()
         brier = float(np.mean((prob - obs) ** 2))
         unc = base_rate * (1.0 - base_rate)
@@ -293,9 +301,9 @@ def main():
     curves, metrics_rows = [], []
     for name, spec in EVENTS.items():
         frame = hotspots.dropna(subset=[spec["prob"],
-                                        "overall_building_hazard_level_gt"])
+                                        f"{REPORTED_PREFIX}_hazard_level_gt"])
         prob = frame[spec["prob"]].to_numpy(dtype=float)
-        obs = spec["truth"](frame["overall_building_hazard_level_gt"].to_numpy())
+        obs = spec["truth"](frame[f"{REPORTED_PREFIX}_hazard_level_gt"].to_numpy())
 
         metrics = brier_decomposition(prob, obs)
         metrics.update(cluster_bootstrap(frame, spec["prob"], spec["truth"],
@@ -313,8 +321,8 @@ def main():
     metrics_frame.to_csv(f"{OUT}/reliability_metrics.csv")
 
     fig, axes = plt.subplots(1, 2, figsize=(11.6, 5.6), facecolor=SURFACE)
-    titles = {"at_least_H2_H3": "Medium hazard or worse",
-              "H4_above": "Severe hazard"}
+    titles = {"at_least_H2": "Medium hazard or worse",
+              "H3_above": "Severe hazard"}
     for ax, (name, spec) in zip(axes, EVENTS.items()):
         ax.set_facecolor(SURFACE)
         _panel(ax, curve_frame[curve_frame["event"] == name].reset_index(drop=True),

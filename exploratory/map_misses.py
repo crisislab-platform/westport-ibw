@@ -37,7 +37,7 @@ import pandas as pd
 import rasterio as rio
 
 from modules.lib import PLACRD_FILE_PATH, SURVEYED_FLOOD_DEPTH_JUL_2021
-from modules.impact_module.impact_module import ImpactModule, WET_DEPTH_MIN
+from modules.impact_module.risk_module import ImpactModule, WET_DEPTH_MIN
 from modules.impact_module.fuzzy_risk import fuzzify
 from modules.forecast_runner.forecast_runner import (
     AFFECTED, NOT_AFFECTED, _damage_to_affected, _hazards_to_affected,

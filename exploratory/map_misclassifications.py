@@ -25,7 +25,7 @@ import rasterio as rio
 from sklearn.metrics import cohen_kappa_score
 
 from modules.lib import PLACRD_FILE_PATH, SURVEYED_FLOOD_DEPTH_JUL_2021
-from modules.impact_module.impact_module import ImpactModule
+from modules.impact_module.risk_module import ImpactModule
 from modules.forecast_runner.forecast_runner import _damage_to_true_risk_level
 
 OUT_CSV = f"{PROJECT_ROOT}/out/misclassified_buildings.csv"

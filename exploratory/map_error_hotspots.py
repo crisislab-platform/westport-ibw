@@ -6,10 +6,11 @@ its SIGNED tier error, predicted minus reference. The sign matters more than the
 magnitude: over-prediction is the safe failure and under-prediction is not, so
 they are never collapsed into one "wrong" colour.
 
-Three timesteps are chosen to sit at different points of an event, since the
-per-timestep verification shows the failure mode is phase-dependent rather than
-uniform: early in a coastal event, mid-way through a tidal one, and after the
-recession of a fluvial one.
+One event per forcing regime -- coastal, fluvial, compound -- and each taken at
+a DIFFERENT point of its event, since the per-timestep verification shows the
+failure mode is phase-dependent rather than uniform: the peak of a coastal
+event, the recession of a fluvial one, and the coincidence of the river and
+tide peaks in a compound one.
 
     python exploratory/map_error_hotspots.py
 
@@ -33,9 +34,11 @@ import pandas as pd
 import rasterio as rio
 import torch
 
-from modules.bc_forecast_module.bc_module import BC_Module
-from modules.impact_module.impact_module import ImpactModule, WET_DEPTH_MIN
-from modules.hazard_forecast_module.model_client import FlowMatchingModelClient
+from modules.data_module.bc_module import BC_Module
+from modules.impact_module.risk_module import (
+    ImpactModule, WET_DEPTH_MIN, REPORTED_PREFIX,
+)
+from modules.hazard_module.model_client import FlowMatchingModelClient
 from modules.utils.spatial_operators.operators import load_flood_map
 
 logging.basicConfig(level=logging.WARNING)
@@ -43,8 +46,11 @@ logging.basicConfig(level=logging.WARNING)
 OUT_PNG = f"{PROJECT_ROOT}/out/error_hotspots.png"
 OUT_CSV = f"{PROJECT_ROOT}/out/error_hotspots.csv"
 
-TIER_COLUMN = "overall_building_hazard_level"
-TERM_LABEL = {1: "H1", 2: "H2-H3", 3: "H4+"}
+# The reported configuration's hazard class -- the full spatial context on
+# h_max (impact_module.REPORTED_CONFIGURATION). Taken from the module rather
+# than named here, so the map shows whatever the system reports.
+TIER_COLUMN = f"{REPORTED_PREFIX}_hazard_level"
+TERM_LABEL = {1: "H1", 2: "H2", 3: "H3+"}
 
 # Signed tier error -> colour and label. Diverging about "correct", so the two
 # failure directions read as opposites rather than as degrees of one thing.
@@ -56,12 +62,22 @@ ERROR_STYLE = {
      2: ("#08306b", "Over by 2"),
 }
 
-# (scenario, position through the event, label). Position is a fraction so the
-# choice is describable rather than an index that means nothing to a reader.
+# (scenario, timestep index, label). The index is explicit rather than a
+# fraction through the event: a fraction cannot address a chosen step reliably,
+# because int(0.383 * 47) is 17 or 18 depending on the last bit of the float,
+# and these steps are cited individually in the text. The index counts from the
+# start of the event on the hourly grid, so it is the same t the per-event
+# figure labels its panels with.
+#
+# One event per forcing regime, each at the phase that regime fails in:
+#   57  t=24  coastal peak
+#   83  t=40  well down the fluvial recession (flow at 22% of peak)
+#   93  t=18  the compound coincidence -- river at 94% of its peak while the
+#             tide is at 86% of its own (sea peaks at t=19, river at t=22)
 PANELS = [
-    (17, 0.20, "Event 17 (coastal)\nearly"),
-    (57, 0.50, "Event 57 (tidal)\nmid-event"),
-    (83, 0.85, "Event 83 (fluvial)\nrecession"),
+    (57, 24, "Event 57 (coastal)\npeak"),
+    (83, 40, "Event 83 (fluvial)\nrecession"),
+    (93, 18, "Event 93 (compound)\npeak coincidence"),
 ]
 
 M, K = 10, 10
@@ -82,9 +98,9 @@ def building_tiers(hazard_module, impact_module, bc_module, timestamp):
     # can answer whether a wrong call was a confident one without a second
     # model run. The per-tier probabilities come too, for the same reason --
     # they are free here and expensive to recover later.
-    carried = ([TIER_COLUMN, "depth_max", "overall_building_hazard_likelihood"]
+    carried = ([TIER_COLUMN, "depth_max", f"{REPORTED_PREFIX}_likelihood"]
                + [c for c in pred.columns
-                  if c.startswith("overall_building_hazard_prob_")])
+                  if c.startswith(f"{REPORTED_PREFIX}_prob_at_least_")])
     joined = gt[["building_id", "geometry", TIER_COLUMN, "depth_max"]].merge(
         pred[["building_id"] + carried],
         on="building_id", suffixes=("_gt", "_pred"),
@@ -100,11 +116,11 @@ def main():
     fig, axes = plt.subplots(1, len(PANELS), figsize=(6.2 * len(PANELS), 7.2))
     rows = []
 
-    for ax, (scenario, position, title) in zip(np.atleast_1d(axes), PANELS):
+    for ax, (scenario, step, title) in zip(np.atleast_1d(axes), PANELS):
         bc_module = BC_Module(scenario)
         impact_module = ImpactModule(scenario)
         steps = sorted(bc_module.bc_dict)
-        timestamp = steps[int(position * (len(steps) - 1))]
+        timestamp = steps[step]
 
         joined, gt_map = building_tiers(hazard_module, impact_module, bc_module, timestamp)
         joined["scenario_id"] = scenario

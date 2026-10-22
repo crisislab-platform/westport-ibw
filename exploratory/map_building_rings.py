@@ -42,7 +42,7 @@ from rasterio import features as rio_features
 from shapely.geometry import shape
 from shapely.ops import unary_union
 
-from modules.impact_module.impact_module import (
+from modules.impact_module.risk_module import (
     GROWTH_STEP_PCT, MAX_BUFFER_PCT, MIN_RING_CELLS,
 )
 from modules.lib import BUILDING_FOOTPRINTS_PATH
