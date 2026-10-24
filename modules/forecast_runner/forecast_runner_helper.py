@@ -53,6 +53,11 @@ TIMING_COLUMNS = (
     "delete_s",
     "publish_s",
     "total_s",
+    # Peak memory over the issue (RuntimeValidation): GPU from the NVIDIA
+    # driver (NaN without one), and the process's RAM, which is the figure on
+    # Apple silicon, where CPU and GPU share it.
+    "gpu_peak_mib",
+    "ram_peak_mib",
 )
 
 

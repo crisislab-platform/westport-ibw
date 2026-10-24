@@ -124,19 +124,21 @@ class Integrator():
             self.inundation_module.iter_hazard_forecast_batches(bc_forecast, hours_per_batch),
         )
 
-    def forecast_issue(self, current_time, timings=None):
+    def forecast_issue(self, current_time, timings=None, forecast_horizon=None, hours_per_batch=None):
         """One issue: boundary conditions -> inundation -> exposure, per step.
 
         Returns the issue's exposure forecast, or None when there are no
         boundary conditions for it. ``timings``, when given, gets bc_s,
-        inundation_s and exposure_s filled in.
+        inundation_s and exposure_s filled in. ``forecast_horizon`` and
+        ``hours_per_batch`` as for iter_inundation.
         """
         if timings is None:
             timings = dict.fromkeys(TIMING_COLUMNS, np.nan)
 
         timings["exposure_s"] = 0.0
         exposure_forecast = {}
-        for timestamp, inundation in self.iter_inundation(current_time, timings=timings):
+        for timestamp, inundation in self.iter_inundation(current_time, forecast_horizon, timings=timings,
+                                                          hours_per_batch=hours_per_batch):
             with _timed(timings, "exposure_s", accumulate=True):
                 exposure_at_timestep = self.exposure_module.get_exposure_assessment(
                     {timestamp: inundation}
@@ -144,7 +146,7 @@ class Integrator():
                 _merge_impact(exposure_forecast, exposure_at_timestep)
         return exposure_forecast or None
 
-    def issue_forecast(self, current_time, timings=None):
+    def issue_forecast(self, current_time, timings=None, forecast_horizon=None, hours_per_batch=None):
         """Forecast one issue and publish it, if publishing is on.
 
         Returns the exposure forecast, or None when the hour has no boundary
@@ -152,7 +154,7 @@ class Integrator():
         delete_s and publish_s from the publisher; the runtime test passes it,
         the operational run does not.
         """
-        exposure_forecast = self.forecast_issue(current_time, timings)
+        exposure_forecast = self.forecast_issue(current_time, timings, forecast_horizon, hours_per_batch)
         if exposure_forecast is None:
             return None
 

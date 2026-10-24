@@ -1,4 +1,4 @@
-from modules.utils.utils import append_metrics
+from modules.utils.utils import GpuMemoryMonitor, RamMonitor, append_metrics
 import pandas as pd
 import numpy as np
 import logging
@@ -25,20 +25,37 @@ class RuntimeValidation():
 
         The stage timers sit inside the Integrator (they have to wrap the
         stages themselves); this only asks for them and writes them down.
+
+        With no forecast horizon (0, the default) the whole event from
+        start_time to end_time is forecast as ONE issue, as validate does --
+        the cost of running a scenario once; otherwise one issue per hour.
+        Hours are sampled self.hours_per_batch at a time, as in validate.
         """
-        for issue_time in self.integrator.issue_times(start_time, end_time):
+        if self.forecast_horizon:
+            issue_times, horizon = self.integrator.issue_times(start_time, end_time), self.forecast_horizon
+        else:
+            start, horizon = self.event_span(start_time, end_time)
+            issue_times = [start]
+        gpu_monitor, ram_monitor = GpuMemoryMonitor().start(), RamMonitor().start()
+        for issue_time in issue_times:
             timings = dict.fromkeys(TIMING_COLUMNS, np.nan)
+            gpu_monitor.reset()
+            ram_monitor.reset()
             issue_start = time.perf_counter()
 
-            if self.integrator.issue_forecast(issue_time, timings) is None:
+            if self.integrator.issue_forecast(issue_time, timings, horizon, self.hours_per_batch) is None:
                 continue
+            timings["gpu_peak_mib"] = gpu_monitor.peak()
+            timings["ram_peak_mib"] = ram_monitor.peak(settle_s=0)
 
-            timings["forecast_horizon"] = self.forecast_horizon
+            timings["forecast_horizon"] = horizon
             timings["num_deep_ensemble"] = self.num_deep_ensemble
             timings["samples_per_member"] = self.samples_per_member
             timings["ensemble_size"] = self.num_deep_ensemble * self.samples_per_member
             timings["total_s"] = time.perf_counter() - issue_start
             self.record_timings(issue_time, timings)
+        gpu_monitor.stop()
+        ram_monitor.stop()
 
     def record_timings(self, issue_time, timings):
         """Append one issue's component timings to out/runtime_metrics.csv.
@@ -68,10 +85,11 @@ class RuntimeValidation():
         logger.info(
             "%s h+%d (%d steps) MxK=%dx%d: inundation %.2fs exposure %.2fs "
             "publish %.2fs (+%.2fs clearing the last issue) total %.2fs "
-            "| per timestep %.2fs",
-            issue_time, self.forecast_horizon, timings["num_timesteps"],
+            "| per timestep %.2fs | peak GPU %.0f MiB, RAM %.0f MiB",
+            issue_time, timings["forecast_horizon"], timings["num_timesteps"],
             timings["num_deep_ensemble"], timings["samples_per_member"],
             timings["inundation_s"], timings["exposure_s"], timings["publish_s"],
             timings["delete_s"], timings["total_s"],
             timings["total_s"] / timings["num_timesteps"],
+            timings["gpu_peak_mib"], timings["ram_peak_mib"],
         )

@@ -27,7 +27,7 @@ def parse_args():
 
     # ── General ──────────────────────────────────────────────────────────────
     parser.add_argument('--start_time', type=str, default="", help="Start time for the forecast")
-    parser.add_argument('--forecast_horizon', type=int, default=0,help="Forecast horizon in hours (run, runtime); validate forecasts the whole event as one run")
+    parser.add_argument('--forecast_horizon', type=int, default=0,help="Forecast horizon in hours (run, runtime); 0 (default): runtime and validate forecast the whole event as one run")
     parser.add_argument('--end_time', type=str, default="", help="End time for the forecast")
     parser.add_argument("--scenario_id", type=int, default=0, help="Id of the flood scenario; 0 is the July 2021 placard test")
     parser.add_argument("--push_to_arcgis", action='store_true', help="Whether to push to arcgis or not")
@@ -43,7 +43,7 @@ def parse_args():
                         help="load ensemble members one at a time and release the decoder's GPU memory after "
                              "each call: about one member's GPU memory instead of all of them, same forecasts")
     parser.add_argument("--hours_per_batch", type=int, default=1,
-                        help="validate: hours the surrogate samples together (1 = one hour at a time)")
+                        help="validate, runtime: hours the surrogate samples together (1 = one hour at a time)")
     parser.add_argument("--model", type=str, default=FLOW_MATCHING_MODEL, choices=FORECAST_MODELS,
                         help="forecast model: the flow-matching surrogate, or the westport 1D-CNN benchmark "
                              "(exported by scripts/export_cnn1d_onnx.py)")
@@ -76,7 +76,8 @@ if __name__ == "__main__":
         ValidationModule(integrator, hours_per_batch=args.hours_per_batch).validate_forecast(
             args.start_time, args.end_time)
     elif args.command == RUNTIME_COMMAND:
-        ValidationModule(integrator).validate_runtime(args.start_time, args.end_time)
+        ValidationModule(integrator, hours_per_batch=args.hours_per_batch).validate_runtime(
+            args.start_time, args.end_time)
     elif args.command == CALIBRATE_COMMAND:
         ValidationModule(integrator).calibrate_spatial_summarisation_method()
     logger.info("Commands executed successfully")

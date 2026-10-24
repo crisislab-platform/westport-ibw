@@ -145,9 +145,16 @@ class HydroMetModule():
         inflow_data['River_flow'] = inflow_data['River_flow'].astype(np.float32)
         inflow_data['Sea_level'] = inflow_data['Sea_level'].astype(np.float32)
         
+        flood_map_files = []
         if self.scenario_id != 0:
-            flood_map_files = glob.glob(f"{FLOOD_MAPS_DIR}/{self.event_name}_depth_snapshots/depth_at_*.tif")
-            flood_map_files.sort()
+            flood_map_files = sorted(glob.glob(f"{FLOOD_MAPS_DIR}/{self.event_name}_depth_snapshots/depth_at_*.tif"))
+            if not flood_map_files:
+                # Forecasting without the simulation (a runtime test on another
+                # machine): every hour of the boundary conditions is kept, and
+                # there is nothing to score against.
+                logger.warning("%s: no simulated flood maps; forecasting every boundary-condition hour",
+                               self.event_name)
+        if flood_map_files:
             
             # Extract the timestamp from the flood map file names and store in a list
             flood_map_timestamps = [self.extract_timestep_from_filename(file) for file in flood_map_files]
@@ -195,7 +202,7 @@ class HydroMetModule():
         #Assign each timestep's boundary condition data to a dictionary for easy access
         for i, row in enumerate(lagged_flow_sea_level):
             self.bc_dict[inflow_data['Date_Time'].iloc[i]] = row
-            if self.scenario_id != 0:
+            if 'flood_map_file' in inflow_data:
                 self.flood_map_dict[inflow_data['Date_Time'].iloc[i]] = inflow_data['flood_map_file'].iloc[i]
 
     @staticmethod
