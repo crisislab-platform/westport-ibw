@@ -23,7 +23,7 @@ LATENT_FLOOD_MAP_STATS_DIR = os.path.join(LATENT_DATA_DIR, "latent_flood_map_sta
 LATENT_DEM_PATH = os.path.join(LATENT_DATA_DIR, "DEM", "dem_latent.pt")
 DEM_FILE_PATH = f"{DATA_ROOT}/data/dem/Topo.tif"
 FLOOD_MAPS_DIR = f"{DATA_ROOT}/data/flood_maps"
-BOUNDARY_CONDITIONS_DIR = f"{DATA_ROOT}/data/flood-mapping-with-ml-main-DATA/DATA/boundary_conditions"
+BOUNDARY_CONDITIONS_DIR = f"{DATA_ROOT}/data/boundary_conditions"
 BUILDING_FOOTPRINTS_PATH = f"{DATA_ROOT}/data/exposure/buildings.gpkg"
 PLACRD_FILE_PATH = f"{DATA_ROOT}/data/Impact-based_data/obs_placard.gpkg"
 ROAD_NETWORK_FILE_PATH = f"{DATA_ROOT}/data/exposure/road_network.gpkg"
@@ -38,19 +38,22 @@ BUILDING_PROPERTY_MAPPING_PATH = f"{DATA_ROOT}/data/exposure/building_property.c
 # it belongs to and the road parcel it fronts, built by
 # exploratory/build_building_links.py from the LINZ property references.
 BUILDING_LINKS_PATH = f"{REPO_ROOT}/out/building_links.csv"
-# The ring each building is sampled through, precomputed by
-# scripts/build_building_rings.py so a forecast loads the geometry instead of
-# rebuilding it per run. Grid-specific, not scenario-specific: the growth loop
-# counts cells geometrically and never reads a depth, so one file serves every
-# scenario and timestep on the same grid. A DIRECTORY rather than a file because
-# the runs use more than one grid -- forecasts on the model grid, validation on
-# the surveyed July 2021 raster -- and those give different rings wherever a
-# building falls outside one of them. ImpactModule names each file after the
-# grid it was built for and stamps the growth parameters inside it, so a cache
-# that does not match the run is ignored rather than silently used.
-BUILDING_RINGS_DIR = f"{REPO_ROOT}/out/rings"
-JULY_2021_BC_FILE_PATH = f"{DATA_ROOT}/data/flood-mapping-with-ml-main-DATA/DATA/boundary_conditions/July2021.csv"
+# The grid cells each building's footprint touches, saved by ExposureModule the
+# first time it meets a grid so later runs load them instead of rasterizing.
+# One file per grid and building set, named by a hash of both.
+FOOTPRINT_INDEX_DIR = f"{DATA_ROOT}/out/exposure/footprint_index"
+JULY_2021_BC_FILE_PATH = f"{DATA_ROOT}/data/boundary_conditions/July2021.csv"
 MODEL_CHECKPOINTS_DIR = f"{DATA_ROOT}/out/model_checkpoints"
 OUTPUT_DIR = f"{DATA_ROOT}/out/forecasts"
 SURVEYED_FLOOD_DEPTH_JUL_2021 = os.path.join(FLOOD_MAPS_DIR, "July_2021_depth_snapshots", "July_2021_surveyed_flood_depth.tif")
 EXPOSURE_STUDY_RESULTS = f"{REPO_ROOT}/out/"
+# Every metrics file the validation module writes (spatial-summary calibration,
+# placards, hourly and per-building event depth scores, runtime).
+VALIDATION_RESULTS_DIR = f"{DATA_ROOT}/out/exposure/validation"
+# Forecast models main.py can score. FLOW_MATCHING_MODEL is the surrogate this
+# system runs; CNN1D_MODEL is the westport 1D-CNN benchmark, run with
+# onnxruntime from what scripts/export_cnn1d_onnx.py writes to CNN1D_CHECKPOINT_DIR.
+FLOW_MATCHING_MODEL = "flow_matching"
+CNN1D_MODEL = "cnn1d"
+FORECAST_MODELS = (FLOW_MATCHING_MODEL, CNN1D_MODEL)
+CNN1D_CHECKPOINT_DIR = f"{DATA_ROOT}/out/model_checkpoints/CNN1D_V1"

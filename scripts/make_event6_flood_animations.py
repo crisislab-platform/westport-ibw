@@ -67,8 +67,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from modules.data_module.bc_module import BC_Module
-from modules.hazard_module.model_client import FlowMatchingModelClient
+from modules.hydromet_module.bc_module import HydroMetModule
+from modules.inundation_module.model_client import InundationModule
 
 
 LOG = logging.getLogger("event6-animation")
@@ -209,7 +209,7 @@ def make_conditions(frame: pd.DataFrame) -> OrderedDict[pd.Timestamp, np.ndarray
     lagged = [f"{name}-{i}" for name in ("River_flow", "Sea_level")
               for i in range(1, lag + 1)]
     work[lagged] = work[lagged].interpolate(limit_direction="both").bfill().ffill()
-    flow_scaler, sea_scaler = BC_Module.load_scalers()
+    flow_scaler, sea_scaler = HydroMetModule.load_scalers()
     flow_cols = ["River_flow"] + [f"River_flow-{i}" for i in range(1, lag + 1)]
     sea_cols = ["Sea_level"] + [f"Sea_level-{i}" for i in range(1, lag + 1)]
     flow = flow_scaler.transform(work[flow_cols].values).astype(np.float32)
@@ -240,7 +240,7 @@ def simulate(args: argparse.Namespace, event: pd.DataFrame) -> None:
 
     LOG.info("Loading hazard model: M=%d, K=%d (%d maps/timestep)",
              args.members, args.samples_per_member, expected)
-    model = FlowMatchingModelClient(
+    model = InundationModule(
         num_members=args.members,
         samples_per_member=args.samples_per_member,
         seed=args.seed,

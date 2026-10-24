@@ -18,9 +18,10 @@ import numpy as np
 import pandas as pd
 import torch
 
-from modules.data_module.bc_module import BC_Module
+from modules.hydromet_module.bc_module import HydroMetModule
 from modules.impact_module.risk_module import ImpactModule
 from modules.forecast_runner.forecast_runner import Integrator
+from modules.validation_module.validation_module import ValidationModule
 from modules.utils.spatial_operators.operators import load_flood_map
 
 logging.basicConfig(level=logging.WARNING)
@@ -52,27 +53,24 @@ def main(scenario_id=57, n_timesteps=6):
     integrator.push_to_arcgis = False
     integrator.samples_per_member = 1
     integrator.num_deep_ensemble = 1
-    integrator.max_area = -np.inf
-    integrator.max_inundation_map = None
-    integrator.max_extent_timestamp = None
-    integrator.bc_module = BC_Module(scenario_id)
-    integrator.impact_module = ImpactModule(scenario_id)
-    integrator.hazard_module = GroundTruthOracle(integrator.bc_module)
+    integrator.hydromet_module = HydroMetModule(scenario_id)
+    integrator.exposure_module = ImpactModule(scenario_id)
+    integrator.inundation_module = GroundTruthOracle(integrator.hydromet_module)
+    validator = ValidationModule(integrator)
 
     captured = []
-    integrator.write_results_simulated = (
+    validator.write_results_simulated = (
         lambda ts, metrics, model=None, valid_time=None, road_metrics=None:
         captured.append({"issue": ts, "valid": valid_time, **metrics})
     )
 
-    steps = sorted(integrator.bc_module.bc_dict)
+    steps = sorted(integrator.hydromet_module.bc_dict)
     # Start where the event is actually wet, so the tier metrics have something
     # to disagree about; a dry timestep agrees trivially and proves nothing.
     start = steps[len(steps) // 2]
     end = steps[min(len(steps) - 1, len(steps) // 2 + n_timesteps - 1)]
     print(f"scenario {scenario_id}: {start} -> {end}\n")
-    integrator.run_hourly_forecast(start_time=str(start), end_time=str(end),
-                                   test_mode=True)
+    validator.validate_forecast(start_time=str(start), end_time=str(end))
 
     d = pd.DataFrame(captured)
     cols = [c for c in ("valid", "n", "n_wet_gt", "depth_max_bias_wet",

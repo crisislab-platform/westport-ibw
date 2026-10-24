@@ -36,8 +36,9 @@ import logging
 
 import pandas as pd
 
-import modules.forecast_runner.forecast_runner as runner
+import modules.validation_module.horizon_validation as validation
 from modules.forecast_runner.forecast_runner import Integrator
+from modules.validation_module.validation_module import ValidationModule
 
 logging.basicConfig(level=logging.WARNING)
 
@@ -69,11 +70,6 @@ CASES = [
 NUM_DEEP_ENSEMBLE, SAMPLES_PER_MEMBER, MIN_EXCEED_PROB = 10, 10, 0.1
 
 
-def _noop(*args, **kwargs):
-    """Swallow a results-file write during a reproduction run."""
-    return None
-
-
 def run_window(scenario_id, forecast_horizon, issue_time):
     """The per-building scored frame for one issue, with geometry.
 
@@ -90,14 +86,14 @@ def run_window(scenario_id, forecast_horizon, issue_time):
         min_exceed_prob=MIN_EXCEED_PROB,
     )
 
-    # Side effects off: these append to files the sweep already wrote.
-    integrator.write_depth_exceedance = _noop
-    integrator.record_timings = _noop
+    # Side effects off: the horizon rows append to a file the sweep already
+    # wrote. The validation loop records no timings, so there is nothing else.
+    validator = ValidationModule(integrator)
     captured_rows = []
-    integrator.write_horizon_results = captured_rows.extend
+    validator.write_horizon_results = captured_rows.extend
 
     captured_window = {}
-    original_window_peak = runner._window_peak
+    original_window_peak = validation._window_peak
 
     def spy(observed, forecast, level_column, likelihood_column):
         window = original_window_peak(observed, forecast, level_column,
@@ -105,16 +101,13 @@ def run_window(scenario_id, forecast_horizon, issue_time):
         captured_window["frame"] = window
         return window
 
-    runner._window_peak = spy
+    validation._window_peak = spy
     try:
         # start == end runs exactly one issue: the loop advances an hour at a
-        # time while current_time <= end_time. test_mode is what gates the
-        # horizon scoring path -- without it the window is forecast and never
-        # scored, so nothing reaches _window_peak.
-        integrator.run_hourly_forecast(start_time=issue, end_time=issue,
-                                       test_mode=True)
+        # time while current_time <= end_time.
+        validator.validate_forecast(start_time=issue, end_time=issue)
     finally:
-        runner._window_peak = original_window_peak
+        validation._window_peak = original_window_peak
 
     if "frame" not in captured_window:
         raise RuntimeError(f"no scored window for event {scenario_id} at {issue}")
@@ -135,7 +128,7 @@ def run_window(scenario_id, forecast_horizon, issue_time):
     # Geometry off the simulated-map exposure frame for the issue step, which
     # the run has just cached; every step of a window carries the same building
     # set and the same footprints.
-    ground_truth = integrator._ground_truth_buildings(issue)
+    ground_truth = validator._ground_truth_buildings(issue)
     centroids = ground_truth.set_index("building_id").geometry.centroid
     window["centroid_x"] = centroids.x.reindex(window.index)
     window["centroid_y"] = centroids.y.reindex(window.index)

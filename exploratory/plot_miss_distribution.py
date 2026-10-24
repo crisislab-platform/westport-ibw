@@ -32,7 +32,7 @@ PROJECT_ROOT = "/home/91/23016891/projects/westport-ibw"
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-from modules.forecast_runner.forecast_runner import (  # noqa: E402
+from modules.forecast_runner.forecast_runner_helper import (  # noqa: E402
     SCORED_CONFIGURATIONS,
 )
 

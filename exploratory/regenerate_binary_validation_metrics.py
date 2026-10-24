@@ -3,7 +3,7 @@
 The published CSV (2026-08-13) no longer reproduces: its depth-thresholded rows
 still match a rerun, but both FIS-tier rows do not, because the fuzzy engine moved
 after it was written. Rather than hand-editing it, this reruns the same scoring path
-that produced it -- Integrator.test_against_placard_data -- so the file keeps its
+that produced it -- ValidationModule.test_against_placard_data -- so the file keeps its
 provenance and column set.
 
 Two things make that path awkward to call directly, both handled here:
@@ -35,7 +35,7 @@ import rasterio as rio
 
 from modules.lib import EXPOSURE_STUDY_RESULTS, SURVEYED_FLOOD_DEPTH_JUL_2021
 from modules.impact_module.risk_module import ImpactModule
-from modules.forecast_runner.forecast_runner import Integrator
+from modules.validation_module.validation_module import ValidationModule
 
 METRICS_FILE = os.path.join(EXPOSURE_STUDY_RESULTS, "binary_validation_metrics.csv")
 SCENARIO_ID = 0
@@ -69,7 +69,7 @@ def main():
     # where the pipeline scores 2247. Same misses and false alarms either way,
     # but different hits, POD and CSI -- so the two disagreed on the published
     # numbers while both looked self-consistent.
-    impact_forecast = ImpactModule(
+    exposure_forecast = ImpactModule(
         "binary_validation_regen",
         domain_raster=SURVEYED_FLOOD_DEPTH_JUL_2021).get_impact_forecast(
             {"17-07-2021 00:00:00": [surveyed_depth]},
@@ -77,11 +77,11 @@ def main():
         )
 
     # Only the attributes the placard scoring path reads; see the module docstring.
-    runner = Integrator.__new__(Integrator)
+    runner = ValidationModule.__new__(ValidationModule)
     runner.scenario_id = SCENARIO_ID
     runner.buffer_m = buffer_multiplier()
 
-    runner.test_against_placard_data(impact_forecast, model="surveyed")
+    runner.test_against_placard_data(exposure_forecast, model="surveyed")
 
     fresh = pd.read_csv(METRICS_FILE)
     columns = ["indicator", "num_buildings_evaluated", "hits", "misses",

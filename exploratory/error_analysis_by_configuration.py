@@ -11,7 +11,7 @@ Writes, all under out/:
 
 Two deliberate differences from error_depth_analysis.py:
 
-* Row selection mirrors Integrator.test_against_placard_data rather than
+* Row selection mirrors ValidationModule.test_against_placard_data rather than
   error_depth_analysis.score(): placards filtered to those with a surveyed depth
   within a 5x5 window, a LEFT merge onto the impact frame, and a dropna over the
   five columns the placard scoring requires. score() instead filters
@@ -43,7 +43,7 @@ from modules.impact_module.risk_module_helper import (
     CLASS_TERMS, configuration_prefix,
 )
 from modules.impact_module.risk_module import ImpactModule
-from modules.forecast_runner.forecast_runner import (
+from modules.forecast_runner.forecast_runner_helper import (
     AFFECTED, NOT_AFFECTED, CONFIGURATION_PREFIXES, SCORED_CONFIGURATIONS,
     _damage_to_affected, _exceedance_to_affected,
 )
@@ -90,7 +90,7 @@ CARRY = [
     for suffix in ("indicator_mean", "hazard_level", "likelihood")
 ]
 
-# The same dropna subset Integrator.test_against_placard_data uses, which is
+# The same dropna subset ValidationModule.test_against_placard_data uses, which is
 # what makes these files reconcile with binary_validation_metrics.csv.
 REQUIRED = ["observed_affected", "max_depth", "mean_depth",
             f"{configuration_prefix('BuildingOnly', 'Max')}_hazard_level",

@@ -34,11 +34,11 @@ import pandas as pd
 import rasterio as rio
 import torch
 
-from modules.data_module.bc_module import BC_Module
+from modules.hydromet_module.bc_module import HydroMetModule
 from modules.impact_module.risk_module import (
     ImpactModule, WET_DEPTH_MIN, REPORTED_PREFIX,
 )
-from modules.hazard_module.model_client import FlowMatchingModelClient
+from modules.inundation_module.model_client import InundationModule
 from modules.utils.spatial_operators.operators import load_flood_map
 
 logging.basicConfig(level=logging.WARNING)
@@ -112,12 +112,12 @@ def building_tiers(hazard_module, impact_module, bc_module, timestamp):
 
 
 def main():
-    hazard_module = FlowMatchingModelClient(num_members=M, samples_per_member=K)
+    hazard_module = InundationModule(num_members=M, samples_per_member=K)
     fig, axes = plt.subplots(1, len(PANELS), figsize=(6.2 * len(PANELS), 7.2))
     rows = []
 
     for ax, (scenario, step, title) in zip(np.atleast_1d(axes), PANELS):
-        bc_module = BC_Module(scenario)
+        bc_module = HydroMetModule(scenario)
         impact_module = ImpactModule(scenario)
         steps = sorted(bc_module.bc_dict)
         timestamp = steps[step]
