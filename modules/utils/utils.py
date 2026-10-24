@@ -103,6 +103,64 @@ class GpuMemoryMonitor:
             self._process = None
 
 
+class RamMonitor:
+    """Peak resident memory (RSS) of this process WHILE work runs, in MiB.
+
+    The same interface as GpuMemoryMonitor, sampled every ``interval_ms`` by a
+    background thread (psutil). Works on every platform, so it is the memory
+    figure that compares across machines -- on Apple silicon the CPU and GPU
+    share this memory and nvidia-smi does not exist. RSS counts what is
+    resident, so a model loaded once (members, decoder, CUDA host buffers) is in
+    every reading; a spike shorter than ``interval_ms`` can fall between samples.
+    """
+
+    def __init__(self, interval_ms=10, pid=None):
+        import threading
+        self.interval_s = interval_ms / 1000
+        self.pid = os.getpid() if pid is None else pid
+        self._lock = threading.Lock()
+        self._current = self._peak = np.nan
+        self._stopped = threading.Event()
+
+    def start(self):
+        import threading
+        try:
+            import psutil
+            self._process = psutil.Process(self.pid)
+        except (ImportError, OSError):
+            return self   # no psutil: peaks stay NaN
+        self._sample()
+        threading.Thread(target=self._read, daemon=True).start()
+        return self
+
+    def _sample(self):
+        mem = self._process.memory_info().rss / 2 ** 20
+        with self._lock:
+            self._current = mem
+            self._peak = mem if np.isnan(self._peak) else max(self._peak, mem)
+
+    def _read(self):
+        while not self._stopped.wait(self.interval_s):
+            try:
+                self._sample()
+            except Exception:
+                return
+
+    def reset(self):
+        """Start a new window, from what the process holds right now."""
+        with self._lock:
+            self._peak = self._current
+
+    def peak(self, settle_s=0.03):
+        """Highest reading since reset(), in MiB (NaN if none)."""
+        time.sleep(settle_s)
+        with self._lock:
+            return float(self._peak)
+
+    def stop(self):
+        self._stopped.set()
+
+
 def check_device():
     """
     Check if CUDA is available and return the appropriate device.

@@ -6,7 +6,7 @@ import pandas as pd
 
 from modules.exposure_module.exposure_module import is_exposed, summarise_members
 from modules.forecast_runner.forecast_runner_helper import _stamp
-from modules.utils.utils import GpuMemoryMonitor
+from modules.utils.utils import GpuMemoryMonitor, RamMonitor
 from modules.validation_module.metrics import (
     contingency,
     crps_ensemble,
@@ -69,18 +69,24 @@ class DepthValidation():
         exposure_total, simulated_before = 0.0, 0.0
         # GPU memory is sampled every 10 ms in the background and its peak
         # taken per stage, over the same windows as the timers: what each stage
-        # needs while it runs, not what is left once it is done.
+        # needs while it runs, not what is left once it is done. The process's
+        # RAM (RSS) is sampled the same way: the memory figure on machines
+        # without an NVIDIA GPU (Apple silicon shares it between CPU and GPU).
         monitor = GpuMemoryMonitor().start()
+        ram_monitor = RamMonitor().start()
         monitor.reset()
+        ram_monitor.reset()
         for batch_index, (valid_times, maps) in enumerate(self.integrator.iter_inundation_batches(
                 *self.event_span(start_time, end_time), timings=timings,
                 hours_per_batch=self.hours_per_batch)):
             simulation_s = timings["inundation_s"] - simulated_before
             simulated_before = timings["inundation_s"]
             gpu_peak_simulation = monitor.peak()
+            ram_peak_simulation = ram_monitor.peak(settle_s=0)
             n_hours, n_members = maps.shape[0], maps.shape[1]
 
             monitor.reset()
+            ram_monitor.reset()
             start = time.perf_counter()
             depths, num_cells = self.exposure_module.building_depths(
                 maps.reshape(n_hours * n_members, *maps.shape[2:]))
@@ -89,11 +95,16 @@ class DepthValidation():
             exposure_s = time.perf_counter() - start
             exposure_total += exposure_s
             gpu_peak_exposure = monitor.peak()
+            ram_peak_exposure = ram_monitor.peak(settle_s=0)
             del maps
             gpu_memory = {"gpu_peak_simulation_mib": gpu_peak_simulation,
                           "gpu_peak_exposure_mib": gpu_peak_exposure,
                           "gpu_peak_mib": float(np.nanmax([gpu_peak_simulation, gpu_peak_exposure]))
-                          if np.isfinite([gpu_peak_simulation, gpu_peak_exposure]).any() else np.nan}
+                          if np.isfinite([gpu_peak_simulation, gpu_peak_exposure]).any() else np.nan,
+                          "ram_peak_simulation_mib": ram_peak_simulation,
+                          "ram_peak_exposure_mib": ram_peak_exposure,
+                          "ram_peak_mib": float(np.nanmax([ram_peak_simulation, ram_peak_exposure]))
+                          if np.isfinite([ram_peak_simulation, ram_peak_exposure]).any() else np.nan}
             scored = num_cells > 0
 
             for valid_time, members, summary in zip(valid_times, depths, summaries):
@@ -118,7 +129,9 @@ class DepthValidation():
 
             # The next simulation window starts here, after this batch's scoring.
             monitor.reset()
+            ram_monitor.reset()
         monitor.stop()
+        ram_monitor.stop()
 
         if not times:
             logger.warning("scenario %s: no step had a simulated map; nothing scored",
@@ -133,7 +146,8 @@ class DepthValidation():
                                  # The event's peak: the highest over its batches.
                                  **{k: (float(np.nanmax([h[k] for h in hourly]))
                                         if any(np.isfinite(h[k]) for h in hourly) else np.nan)
-                                    for k in ("gpu_peak_mib", "gpu_peak_simulation_mib", "gpu_peak_exposure_mib")}})
+                                    for k in ("gpu_peak_mib", "gpu_peak_simulation_mib", "gpu_peak_exposure_mib",
+                                              "ram_peak_mib", "ram_peak_simulation_mib", "ram_peak_exposure_mib")}})
 
     def _run_keys(self):
         """What a summary row was produced from: the event and the ensemble,

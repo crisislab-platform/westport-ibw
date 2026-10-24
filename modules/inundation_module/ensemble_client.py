@@ -44,8 +44,14 @@ logger = logging.getLogger(__name__)
 MEMBER_FILE_PATTERN = re.compile(r"member_(\d+)_seed_(\d+)\.onnx$")
 
 
-def select_providers(preferred=("CUDAExecutionProvider", "CPUExecutionProvider"),
-                     use_tf32=False):
+# Apple silicon: set WESTPORT_ORT_COREML=1 to try onnxruntime's CoreML provider
+# (the M-series GPU / Neural Engine) before the CPU. Off by default: CoreML may
+# compute in reduced precision, so its depths can differ from the CPU's (as
+# TF32 does below), and nodes it cannot take still run on the CPU.
+USE_COREML = os.environ.get("WESTPORT_ORT_COREML", "0") == "1"
+
+
+def select_providers(preferred=None, use_tf32=False):
     """Keep only providers this onnxruntime build actually has.
 
     Passing an unavailable provider does not raise -- onnxruntime logs a
@@ -65,6 +71,10 @@ def select_providers(preferred=("CUDAExecutionProvider", "CPUExecutionProvider")
     Disabling it costs ~60% on the decoder and still leaves it ~15x faster than
     CPU. Pass use_tf32=True to trade that agreement back for the speed.
     """
+    if preferred is None:
+        preferred = ("CUDAExecutionProvider",
+                     *(("CoreMLExecutionProvider",) if USE_COREML else ()),
+                     "CPUExecutionProvider")
     available = ort.get_available_providers()
     providers = []
     for name in preferred:
