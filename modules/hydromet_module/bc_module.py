@@ -2,7 +2,8 @@
 This module is responsible for fetching the boundary condition data and processing it to be used in the hazard model.
 """
 import pandas as pd
-from modules.lib import JULY_2021_BC_FILE_PATH, LATENT_FLOW_MATCHING, MODEL_CHECKPOINTS_DIR, BOUNDARY_CONDITIONS_DIR, FLOOD_MAPS_DIR
+from modules.lib import (JULY_2021_BC_FILE_PATH, LATENT_FLOW_MATCHING, MODEL_CHECKPOINTS_DIR, BOUNDARY_CONDITIONS_DIR,
+                         FLOOD_MAPS_DIR, SIMULATED_MAP_TIMES_PATH)
 import os
 import joblib
 import numpy as np
@@ -19,6 +20,21 @@ logger = logging.getLogger(__name__)
 # July 2021 is forecast from here: the flood began on the 16th. The lags of the
 # first hours still come from the record before it.
 JULY_2021_START = pd.Timestamp("2021-07-16 00:00:00")
+
+
+def simulated_map_files(event_name):
+    """``{valid_time: map file}`` of the event's simulated flood maps -- the hours
+    a test event is forecast at. Without the maps on disk, the times are read
+    from SIMULATED_MAP_TIMES_PATH (files None), so the same hours are forecast;
+    empty when neither has the event."""
+    files = glob.glob(f"{FLOOD_MAPS_DIR}/{event_name}_depth_snapshots/depth_at_*.tif")
+    if files:
+        return {pd.to_datetime(os.path.basename(f).split("depth_at_")[1].split(".tif")[0],
+                               format="%Y-%m-%d_%H-%M-%S"): f for f in sorted(files)}
+    if os.path.exists(SIMULATED_MAP_TIMES_PATH):
+        times = pd.read_csv(SIMULATED_MAP_TIMES_PATH, parse_dates=["valid_time"])
+        return dict.fromkeys(times.loc[times["event_name"] == event_name, "valid_time"])
+    return {}
 
 
 class HydroMetModule():
@@ -145,25 +161,16 @@ class HydroMetModule():
         inflow_data['River_flow'] = inflow_data['River_flow'].astype(np.float32)
         inflow_data['Sea_level'] = inflow_data['Sea_level'].astype(np.float32)
         
-        flood_map_files = []
-        if self.scenario_id != 0:
-            flood_map_files = sorted(glob.glob(f"{FLOOD_MAPS_DIR}/{self.event_name}_depth_snapshots/depth_at_*.tif"))
-            if not flood_map_files:
-                # Forecasting without the simulation (a runtime test on another
-                # machine): every hour of the boundary conditions is kept, and
-                # there is nothing to score against.
-                logger.warning("%s: no simulated flood maps; forecasting every boundary-condition hour",
-                               self.event_name)
-        if flood_map_files:
-            
-            # Extract the timestamp from the flood map file names and store in a list
-            flood_map_timestamps = [self.extract_timestep_from_filename(file) for file in flood_map_files]
-            
-            inflow_data['Flood_Map_Available'] = inflow_data['Date_Time'].apply(lambda x: True if x in flood_map_timestamps else False)
-            inflow_data['flood_map_file'] = inflow_data['Date_Time'].apply(lambda x: next((file for file in flood_map_files if self.extract_timestep_from_filename(file) == x), None))
-            inflow_data = inflow_data[inflow_data['Flood_Map_Available']]
-            inflow_data = inflow_data[inflow_data['Flood_Map_Available']]
-            inflow_data.drop(columns=['Flood_Map_Available'], inplace=True)
+        # A test event is forecast only at the hours the simulation has a map
+        # (simulated_map_files: from the maps, or from their list of times on a
+        # machine without them).
+        map_files = simulated_map_files(self.event_name) if self.scenario_id != 0 else {}
+        if self.scenario_id != 0 and not map_files:
+            logger.warning("%s: no simulated flood maps or list of their times; forecasting every "
+                           "boundary-condition hour", self.event_name)
+        if map_files:
+            inflow_data = inflow_data[inflow_data['Date_Time'].isin(list(map_files))].copy()
+            inflow_data['flood_map_file'] = inflow_data['Date_Time'].map(map_files)
 
         inflow_data = self._to_hourly_grid(inflow_data)
 

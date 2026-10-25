@@ -1,4 +1,3 @@
-import glob
 import logging
 import os
 
@@ -9,7 +8,8 @@ import pandas as pd
 import torch
 
 from modules.inundation_module.ensemble_client import _warn_on_cpu_fallback, select_providers
-from modules.lib import BOUNDARY_CONDITIONS_DIR, CNN1D_CHECKPOINT_DIR, FLOOD_MAPS_DIR
+from modules.hydromet_module.bc_module import simulated_map_files
+from modules.lib import BOUNDARY_CONDITIONS_DIR, CNN1D_CHECKPOINT_DIR
 
 logger = logging.getLogger(__name__)
 
@@ -60,9 +60,7 @@ class Cnn1dInundation():
         bcs = pd.read_csv(os.path.join(BOUNDARY_CONDITIONS_DIR, f"{event_code}.csv"),
                           usecols=["Date_Time", "River_flow", "Sea_level"])
         bcs["Date_Time"] = pd.to_datetime(bcs["Date_Time"])
-        map_times = {pd.to_datetime(os.path.basename(f).split("depth_at_")[1].split(".tif")[0],
-                                    format="%Y-%m-%d_%H-%M-%S")
-                     for f in glob.glob(f"{FLOOD_MAPS_DIR}/{event_name}_depth_snapshots/depth_at_*.tif")}
+        map_times = set(simulated_map_files(event_name))
         on_the_hour = bcs["Date_Time"].dt.minute == 0
         bcs = bcs[(bcs["Date_Time"].isin(map_times) & on_the_hour) if map_times else on_the_hour]
         bcs = bcs.sort_values(by="Date_Time").reset_index(drop=True)

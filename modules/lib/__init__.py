@@ -23,6 +23,9 @@ LATENT_FLOOD_MAP_STATS_DIR = os.path.join(LATENT_DATA_DIR, "latent_flood_map_sta
 LATENT_DEM_PATH = os.path.join(LATENT_DATA_DIR, "DEM", "dem_latent.pt")
 DEM_FILE_PATH = f"{DATA_ROOT}/data/dem/Topo.tif"
 FLOOD_MAPS_DIR = f"{DATA_ROOT}/data/flood_maps"
+# The simulated maps' timestamps (event_name, valid_time) without the maps: lets
+# a machine without them (the laptop runtime bundle) forecast the same hours.
+SIMULATED_MAP_TIMES_PATH = f"{FLOOD_MAPS_DIR}/simulated_map_times.csv"
 BOUNDARY_CONDITIONS_DIR = f"{DATA_ROOT}/data/boundary_conditions"
 BUILDING_FOOTPRINTS_PATH = f"{DATA_ROOT}/data/exposure/buildings.gpkg"
 PLACRD_FILE_PATH = f"{DATA_ROOT}/data/Impact-based_data/obs_placard.gpkg"
